@@ -1,0 +1,16 @@
+//@version=6
+indicator("MEXC paper technical alerts", overlay=true)
+token = input.string("", "Webhook secret (never an exchange key)")
+fast = ta.ema(close, 9)
+slow = ta.ema(close, 21)
+r = ta.rsi(close, 14)
+[m, s, histogram] = ta.macd(close, 12, 26, 9)
+enter = ta.crossover(fast, slow) and r >= 50 and r <= 65 and histogram > 0
+exit = ta.crossunder(fast, slow) or r < 45
+if barstate.isconfirmed and str.length(token) >= 32 and (enter or exit)
+    action = exit ? "sell" : "buy"
+    identifier = syminfo.ticker + ":" + str.tostring(time) + ":" + action
+    message = '{"secret":"' + token + '","id":"' + identifier + '","symbol":"' + syminfo.ticker + '","action":"' + action + '","strategy":"technical","timeframe":"1h","sent_at":' + str.tostring(int(timenow / 1000)) + ',"candle_time":' + str.tostring(int(time / 1000)) + '}'
+    alert(message, alert.freq_once_per_bar_close)
+plot(fast, color=color.green)
+plot(slow, color=color.orange)

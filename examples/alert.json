@@ -1,0 +1,10 @@
+{
+  "secret": "REPLACE_WITH_YOUR_WEBHOOK_SECRET_NOT_AN_EXCHANGE_KEY",
+  "id": "UNIQUE_ID_FOR_THIS_CANDLE_AND_ACTION",
+  "symbol": "BTCUSDT",
+  "action": "buy",
+  "strategy": "technical",
+  "timeframe": "1h",
+  "sent_at": 0,
+  "candle_time": 0
+}
