@@ -1,19 +1,19 @@
 {
   "mode": "paper",
-  "option": "A",
+  "option": "C",
   "paper_cash": 50,
   "symbols": ["BTCUSDT"],
   "total_cap": 50,
   "position_cap": 10,
-  "daily_loss": 0.10,
+  "daily_loss": 0.1,
   "floor": 25,
   "risk_per_trade": 0.005,
   "max_positions": 1,
   "fee": 0.001,
   "slippage": 0.001,
   "min_paper_order": 1,
-  "copy_trading": false,
+  "copy_trading": true,
   "tradovate": false,
   "portal_strategies": false,
-  "news": false
+  "news": true
 }

@@ -29,7 +29,8 @@ class Ledger:
             raise ValueError('Paper cash must be between 25 and 50.')
         return dict(mode='paper', cash=cash, positions={}, prices={}, day=utc_day(now),
                     day_start=cash, paused=False, killed=False, review_required=False,
-                    breach_day=None, floor_breached=False, seen=[], events=[], reviews=[])
+                    breach_day=None, floor_breached=False, seen=[], events=[], reviews=[],
+                    news_blocks=[])
 
     def transact(self, now, operation):
         with sqlite3.connect(self.path, timeout=10) as db:
@@ -100,6 +101,44 @@ class Ledger:
             return dict(command=command, paused=state['paused'], killed=state['killed'])
         return self.transact(now, operation)
 
+    def news_block(self, symbol, hours, reason, now):
+        if not self.config.get('news'):
+            raise ValueError('News veto is off. Use option C with news true in config.json.')
+        if symbol != '*' and symbol not in self.config['symbols']:
+            raise ValueError('Symbol must be an allowed symbol or * for all.')
+        if not finite(hours) or not 1 <= hours <= 168:
+            raise ValueError('Hours must be from 1 to 168.')
+        reason = reason.strip()
+        if not 1 <= len(reason) <= 200:
+            raise ValueError('A reason of 1 to 200 characters is required.')
+        def operation(state):
+            blocks = [b for b in state.setdefault('news_blocks', []) if b['until'] > now]
+            if len(blocks) >= 50:
+                raise ValueError('Too many active blocks; clear some first.')
+            until = now+hours*3600
+            blocks.append(dict(symbol=symbol, created=now, until=until, reason=reason))
+            state['news_blocks'] = blocks
+            self.event(state, now, kind='news_block', symbol=symbol, until=until, reason=reason)
+            return dict(symbol=symbol, until=until, reason=reason, active_blocks=len(blocks))
+        return self.transact(now, operation)
+
+    def news_clear(self, symbol, note, now):
+        if not note.strip():
+            raise ValueError('A written note is required to remove a veto.')
+        def operation(state):
+            blocks = state.setdefault('news_blocks', [])
+            kept = [b for b in blocks if b['symbol'] != symbol and b['until'] > now]
+            removed = len([b for b in blocks if b['symbol'] == symbol and b['until'] > now])
+            state['news_blocks'] = kept
+            self.event(state, now, kind='news_clear', symbol=symbol, note=note.strip(), removed=removed)
+            return dict(symbol=symbol, removed=removed, active_blocks=len(kept))
+        return self.transact(now, operation)
+
+    def news_list(self, now):
+        blocks = self.status(now).get('news_blocks', [])
+        return dict(news_veto_enabled=bool(self.config.get('news')),
+                    active_blocks=[b for b in blocks if b['until'] > now])
+
     def _sell(self, state, symbol, price, now, reason):
         p = state['positions'].pop(symbol)
         sell_price = price * (1-float(self.config['slippage']))
@@ -143,10 +182,12 @@ class Ledger:
                 return dict(accepted=False, reason=reason)
             if symbol not in self.config['symbols']:
                 return reject('symbol_not_allowed')
-            if action not in ('buy', 'sell') or source not in ('tradingview', 'scanner', 'demo', 'backtest'):
+            if action not in ('buy', 'sell') or source not in ('tradingview', 'scanner', 'copy', 'demo', 'backtest'):
                 return reject('unsupported_signal_source_or_action')
-            if source == 'scanner' and self.config['option'] != 'B':
+            if source == 'scanner' and self.config['option'] not in ('B', 'C'):
                 return reject('scanner_disabled')
+            if source == 'copy' and not self.config.get('copy_trading'):
+                return reject('copy_disabled')
             if not finite(price) or price <= 0 or not finite(atr) or atr <= 0:
                 return reject('invalid_price_or_atr')
             state['prices'][symbol] = price
@@ -159,10 +200,15 @@ class Ledger:
                 return dict(accepted=True, mode='paper', action='sell')
             if state['paused'] or state['killed'] or state['review_required']:
                 return reject('safety_halt')
+            if self.config.get('news') and any(b['symbol'] in (symbol, '*') and b['until'] > now
+                                                for b in state.get('news_blocks', [])):
+                return reject('news_veto')
             if symbol in state['positions']:
                 return reject('position_already_open')
             if len(state['positions']) >= min(5, int(self.config['max_positions'])):
                 return reject('max_positions')
+            if source == 'copy' and source_time is None:
+                return reject('copy_requires_source_time')
             if source_time is not None and (not finite(source_time) or not 0 <= now-source_time <= 120):
                 return reject('stale_or_future_signal')
             if source not in ('demo', 'backtest'):

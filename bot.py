@@ -12,7 +12,9 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import copytrade
 import market
+import records
 from risk import Ledger, finite
 from strategies import evaluate, indicators
 
@@ -23,10 +25,14 @@ def load_config(path):
     config = json.loads(Path(path).read_text())
     if config['mode'] != 'paper':
         raise ValueError('Stage 1 is PAPER ONLY. Live execution is not implemented or enabled.')
-    if config['option'] not in ('A', 'B'):
-        raise ValueError('Option C needs an identified, permitted news provider and is deferred.')
-    if any(config.get(k) for k in ('copy_trading', 'tradovate', 'portal_strategies', 'news')):
-        raise ValueError('Optional account connections are deferred; keep them disabled.')
+    if config['option'] not in ('A', 'B', 'C'):
+        raise ValueError('Option must be A, B or C.')
+    if config['news'] is not (config['option'] == 'C'):
+        raise ValueError('News veto is part of option C: news must be true for C and false for A or B.')
+    if type(config['copy_trading']) is not bool:
+        raise ValueError('copy_trading must be true or false.')
+    if config['tradovate'] or config['portal_strategies']:
+        raise ValueError('Tradovate and portal strategies are not implemented; keep them disabled.')
     for name in ('total_cap','position_cap','floor','risk_per_trade','daily_loss','fee','slippage','min_paper_order'):
         if not finite(config[name]) or config[name] <= 0:
             raise ValueError(f'{name} must be a positive finite number.')
@@ -151,7 +157,7 @@ def serve(ledger, config, port):
                 state = ledger.status(time.time())
                 quotes = {symbol:market.price(symbol) for symbol in state['positions']}
                 ledger.mark(quotes, time.time())
-                if config['option'] == 'B':
+                if config['option'] in ('B', 'C'):
                     for candidate in market.scan(config['symbols']):
                         if candidate['action'] == 'hold':
                             continue
@@ -168,6 +174,10 @@ def serve(ledger, config, port):
     threading.Thread(target=worker, daemon=True).start()
     threading.Thread(target=monitor, daemon=True).start()
     print(f'PAPER ONLY. Webhook: http://127.0.0.1:{port}/webhook. No real orders or exchange keys.')
+    if config['news']:
+        print('NEWS VETO ON: it blocks only the entries you record with news-block. No news provider is connected.')
+    if config['copy_trading']:
+        print('COPY TRADING SLOT ON: no provider is connected; nothing is copied automatically.')
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -235,8 +245,25 @@ def main():
     parser.add_argument('--config', default=str(ROOT/'config.json'))
     parser.add_argument('--state', default=str(ROOT/'paper.sqlite'))
     sub = parser.add_subparsers(dest='command', required=True)
-    for name in ('init','status','pause','resume','kill','demo','setup','scan'):
+    for name in ('init','status','pause','resume','kill','demo','setup','scan','news-list','copy-status','copy-report'):
         sub.add_parser(name)
+    block = sub.add_parser('news-block')
+    block.add_argument('--symbol', required=True, help='an allowed symbol such as BTCUSDT, or * for all')
+    block.add_argument('--hours', type=float, required=True)
+    block.add_argument('--reason', required=True)
+    clear = sub.add_parser('news-clear')
+    clear.add_argument('--symbol', required=True)
+    clear.add_argument('--note', required=True)
+    copy_signal = sub.add_parser('copy-signal')
+    copy_signal.add_argument('--provider', choices=copytrade.PROVIDERS, required=True)
+    copy_signal.add_argument('--id', required=True)
+    copy_signal.add_argument('--symbol', required=True)
+    copy_signal.add_argument('--action', choices=('buy','sell'), required=True)
+    copy_signal.add_argument('--seconds-ago', type=float, required=True)
+    export = sub.add_parser('export-records')
+    export.add_argument('--output', required=True)
+    export.add_argument('--rates', help='CSV with columns date, aud_per_usdt')
+    export.add_argument('--flat-rate', type=float, help='one AUD per USDT rate for every row')
     review = sub.add_parser('review-rearm')
     review.add_argument('--note', required=True)
     start = sub.add_parser('start')
@@ -256,6 +283,25 @@ def main():
                 result = {'mode':'paper','equity':result['equity'],'state_file':args.state,'live_enabled':False}
         elif args.command in ('pause','resume','kill','review-rearm'):
             result = ledger.control(args.command, time.time(), getattr(args,'note',''))
+        elif args.command == 'news-block':
+            result = ledger.news_block(args.symbol, args.hours, args.reason, time.time())
+        elif args.command == 'news-clear':
+            result = ledger.news_clear(args.symbol, args.note, time.time())
+        elif args.command == 'news-list':
+            result = ledger.news_list(time.time())
+        elif args.command == 'copy-status':
+            result = copytrade.status(config)
+        elif args.command == 'copy-signal':
+            if not finite(args.seconds_ago) or args.seconds_ago < 0:
+                raise ValueError('seconds-ago must be zero or more.')
+            now = time.time()
+            event = dict(provider=args.provider, id=args.id, symbol=args.symbol,
+                         action=args.action, source_time=now-args.seconds_ago)
+            result = copytrade.process_event(event, ledger, config, now, market)
+        elif args.command == 'copy-report':
+            result = copytrade.report(ledger.status(time.time()))
+        elif args.command == 'export-records':
+            result = records.export(ledger.status(time.time()), args.output, args.rates, args.flat_rate)
         elif args.command == 'demo':
             result = demo(config)
         elif args.command == 'setup':

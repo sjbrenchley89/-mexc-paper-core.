@@ -4,7 +4,9 @@ This guide contains no programming code. Commands in ordinary text are things to
 
 **Delivered now:** a Python paper-only command-line core, private local webhook receiver, two built-in strategies, a ranked scanner, cost-aware simulated positions, persistent risk controls, historical CSV backtests, and local tests. No Python packages need to be installed.
 
-**Not delivered or enabled yet:** authenticated MEXC account access, real order execution, dashboard, news provider, copy feeds, Tradovate connection, or portal imports. Optional connection settings cannot be enabled in this stage. Changing mode to live produces an error. This is deliberately the first installment, not the completed live system.
+**Added in the second installment:** a news veto (it blocks entries you record by hand; no news provider is connected), a copy-trading slot with both providers disconnected, and a CSV export with Australian dollar columns. See step 19.
+
+**Not delivered or enabled yet:** authenticated MEXC account access, real order execution, dashboard, an automatic news feed, any connected FOMO or Astral AI feed, Tradovate connection, or portal imports. Tradovate and portal settings cannot be enabled. Changing mode to live produces an error. This is deliberately not the completed live system.
 
 The full read_thread capability requested for the referenced chat was unavailable. A task-summary reader returned summaries, but the earlier bot's code was not retrieved or relied upon. This project was created independently.
 
@@ -20,11 +22,11 @@ The full read_thread capability requested for the referenced chat was unavailabl
 
 2. **Choose the sources — safe now.**
 
-   Goal: start with a setup that can be evaluated. No selection was supplied, so the default is Option A: TradingView only. Option B adds the breakout scanner. Option C would add a chosen news provider and is deferred until its rules, permitted access, historical coverage, limits, and price are known.
+   Goal: start with a setup that can be evaluated. You chose Option C: the TradingView technical strategy, the breakout scanner, and a news veto that can only block entries. Option A (TradingView only) and Option B (adds the scanner) remain available by editing option in config.json; news must then be false.
 
-   Copy trading, Tradovate, and portal strategies stay off. Before any later connection, supply the exact FOMO and Astral AI URLs and permitted feed/API documentation, your exact country and account type, the intended Tradovate use, and your portal's entry, exit, and stop rules or source material. No portal recommendations are assumed.
+   Copy trading is switched on in settings, but both providers are disconnected, so nothing is copied automatically. Tradovate and portal strategies stay off. Your country is Australia and your account type is individual. Before any later connection, supply the exact FOMO and Astral AI URLs and permitted feed/API documentation, your exact country and account type, the intended Tradovate use, and your portal's entry, exit, and stop rules or source material. No portal recommendations are assumed.
 
-   Expected result: config.json says paper, A, and false for optional integrations. If it does not, restore those values before proceeding.
+   Expected result: config.json says mode paper, option C, news true, copy_trading true, and false for tradovate and portal_strategies. If it does not, restore those values before proceeding.
 
 3. **Check regional and provider eligibility — safe now, before subscriptions or keys.**
 
@@ -35,6 +37,8 @@ The full read_thread capability requested for the referenced chat was unavailabl
    For Tradovate, obtain confirmation of resident eligibility, API entitlement and charges, automation permission, market-data licensing, and brokerage funding/margin requirements. It is a futures brokerage: it cannot act as this initial spot module. Whole futures contracts generally exceed $10 in notional exposure. Measuring only margin would evade the cap. A future separate module would need explicit futures acceptance, leverage at most 2 times, and the same shared exposure and loss checks; if no contract meets the limits, it must reject all orders.
 
    For FOMO and Astral AI, independently confirm their terms permit exporting and mirroring activity into MEXC. A connector displaying trade history is not proof that unattended external mirroring is permitted. No provider terms or current regional eligibility were successfully verified in this session. Keep these items unresolved and the connections disabled until verified. If official permitted access is unavailable, leave a disconnected adapter; no scraping or account-password sharing.
+
+   For Australia: [AUSTRAC](https://www.austrac.gov.au) keeps a register of digital currency exchanges. Check it and ASIC's warnings list for MEXC yourself. This session could not confirm either way, and reports conflict. Ask MEXC support in writing whether an Australian individual may use automated spot API trading. If the answer is no or unclear, stay in paper mode. Buying USDT with AUD and moving it to MEXC has its own fees, which can take a real share of $50. The ATO treats each coin-to-coin trade as a capital gains event, so record keeping matters (step 19).
 
    Expected result: a saved record of eligibility and terms for each enabled service. If you cannot obtain it, continue offline paper testing only.
 
@@ -77,7 +81,7 @@ The full read_thread capability requested for the referenced chat was unavailabl
    | Setting | Default | Meaning |
    |---|---|---|
    | mode | paper | Live is unavailable; changing this makes startup fail. |
-   | option | A | One technical strategy; B adds the scanner. C is deferred. |
+   | option | C | A is one technical strategy; B adds the scanner; C adds the news veto. |
    | paper_cash | 50 | Starting simulated funds, used only for a new ledger. |
    | symbols | BTCUSDT | Explicit allowed spot pairs. Scanner ranks only this approved list; add verified liquid pairs later. |
    | total_cap | 50 | Maximum allocated purchase cost across positions, including entry fees. Values above $50 cannot raise the code limit. |
@@ -90,10 +94,10 @@ The full read_thread capability requested for the referenced chat was unavailabl
    | fee | 0.001 | Assumed 0.1% per side; replace with independently verified actual fees. This is not a current MEXC fee claim. |
    | slippage | 0.001 | Assumed 0.1% worse price per side. Slippage means the actual fill differs from the quoted price. Stress-test larger values. |
    | min_paper_order | 1 | Additional simulation minimum. Current exchange minimums and quantity increments also have to pass. The bot skips small orders instead of increasing them above risk limits. |
-   | copy_trading | false | FOMO/Astral adapters not connected or implemented in this installment. |
+   | copy_trading | true | Turns on the copy slot. Both providers stay disconnected; nothing is copied automatically. |
    | tradovate | false | No futures connection or orders. |
    | portal_strategies | false | No rules imported. |
-   | news | false | No provider selected or billed. |
+   | news | true | News veto. Must be true for option C and false for A or B. No provider is connected. |
 
    ATR means Average True Range: a measure of recent price movement that accounts for gaps. The core computes 14-period ATR from closed one-hour candles and sizes positions so a stop two ATR below entry fits the planned loss budget. It takes the smaller of that size, available paper cash, and the hard caps. Fees and slippage count toward sizing. Actual gaps can exceed the planned loss.
 
@@ -107,7 +111,7 @@ The full read_thread capability requested for the referenced chat was unavailabl
 
    Strategy 2, breakout: buy when the close exceeds the highs of the previous 20 candles and volume is at least twice the previous 20-candle average. Sell below the previous 10-candle low or at the same stop and target. Scanner candidates must have at least one million USDT of 24-hour volume, a 1–20% positive daily change, ATR between 0.3% and 3% of price, spread at most 0.2%, and at least $1,000 of depth on each side within 0.5% of the midpoint. Spread is the difference between the best buy and sell quotes; depth measures available liquidity. Candidates are ranked by volume spike and daily change, penalized for wider spread.
 
-   Strategy 2 is disabled in Option A. Option C's third strategy is deliberately undefined until your provider and usable sentiment scale are supplied; no invented provider or portal recommendation is included. Imported strategies later require explicit entry, exit, stop, eligible instruments, timeframe, version, and approval evidence.
+   Strategy 2 is disabled in Option A. Strategy 3, the news veto, never buys. While a block is active for a symbol (or for all symbols), new entries from every source are rejected, including TradingView, scanner and copy signals. It does not sell anything you already hold; protective exits still work as before. Blocks expire after 1 to 168 hours. You record a block yourself after reading an official notice, such as a delisting or maintenance announcement on MEXC. Nothing reads news automatically yet, so the veto is only as good as your blocks. No portal recommendation is included. Imported strategies later require explicit entry, exit, stop, eligible instruments, timeframe, version, and approval evidence.
 
 10. **Create the webhook secret — safe now.**
 
@@ -175,9 +179,9 @@ The full read_thread capability requested for the referenced chat was unavailabl
 
     Goal: make controls easier without introducing a second risk engine. The future dashboard must call the same control layer as the CLI and show status, open positions, equity, daily profit/loss versus the 10% threshold, distance to $25, data age, and the kill switch. The daily breach review note and explicit re-arm must be available there. Keep it authenticated and private.
 
-    All future signal adapters must use one shared ledger across venues, reserve outstanding orders, log source and latency, and obey $50 total exposure, $10 per position, the account floor, and the manual-review latch. They may not submit directly to a broker. Futures exposure must count notional, not just margin; dollars committed to separate accounts still count toward the same total budget. Until an official feed and its permitted unattended use are confirmed, a FOMO/Astral adapter remains disconnected. Until you supply portal rules, its import path remains empty. News remains off until provider coverage and recurring costs are known.
+    All future signal adapters must use one shared ledger across venues, reserve outstanding orders, log source and latency, and obey $50 total exposure, $10 per position, the account floor, and the manual-review latch. They may not submit directly to a broker. Futures exposure must count notional, not just margin; dollars committed to separate accounts still count toward the same total budget. Until an official feed and its permitted unattended use are confirmed, a FOMO/Astral adapter remains disconnected. Until you supply portal rules, its import path remains empty. The news veto stays manual until a provider is chosen, its coverage and recurring costs are known, and its terms permit this use.
 
-    Expected result: optional modules cannot trade simply because an account is connected. Each requires explicit selection, qualification evidence, and the same risk checks. None of these interfaces is implemented in the current core.
+    Expected result: optional modules cannot trade simply because an account is connected. Each requires explicit selection, qualification evidence, and the same risk checks. The copy slot and manual news veto exist (step 19) and obey those checks; no feed, Tradovate or portal interface is implemented.
 
 17. **Use this future go-live checklist — real money, wait.**
 
@@ -198,6 +202,19 @@ The full read_thread capability requested for the referenced chat was unavailabl
 
 18. **Know what each file does — safe now.**
 
-    Goal: know where to look without changing program internals. bot.py is the launcher and webhook receiver. risk.py owns the paper ledger, sizing, caps, pauses, and exits. market.py reads only official public MEXC spot data. strategies.py contains the two defined indicator rules. config.json contains ordinary settings. paper.sqlite saves simulated balances, unique alert IDs, review notes, and events. .env stores the private webhook token locally; it is excluded from the supplied ZIP. examples contains supplied alert files. tests contains the local safety checks. docs contains the staged implementation scope.
+    Goal: know where to look without changing program internals. bot.py is the launcher and webhook receiver. risk.py owns the paper ledger, sizing, caps, pauses, exits, and the news veto. copytrade.py holds the disconnected copy slot and its report. records.py writes the Australian-dollar CSV. market.py reads only official public MEXC spot data. strategies.py contains the two defined indicator rules. config.json contains ordinary settings. paper.sqlite saves simulated balances, unique alert IDs, review notes, and events. .env stores the private webhook token locally; it is excluded from the supplied ZIP. examples contains supplied alert files. tests contains the local safety checks. docs contains the staged implementation scope.
 
-    Type python -m unittest discover -s tests -v to run the local checks. Expected result: 17 tests pass. These checks, a local HTTP authentication check, and synthetic backtest runs passed in the task environment. Current MEXC connectivity, TradingView compilation and delivery, provider terms, and profitability were not verified.
+    Type python -m unittest discover -s tests -v to run the local checks. Expected result: 44 tests pass. These checks, a local HTTP authentication check, and synthetic backtest runs passed in the task environment. Current MEXC connectivity, TradingView compilation and delivery, provider terms, and profitability were not verified.
+
+19. **Use the news veto, copy slot, and AUD records — safe now.**
+
+    Goal: try the three added features in paper mode. Type each command in the project folder, using python3 if needed.
+
+    News veto. After reading an official notice yourself, type python bot.py news-block --symbol BTCUSDT --hours 6 --reason "Delisting notice on MEXC announcements". Use * instead of BTCUSDT to block every symbol, for example during an exchange incident. Expected result: a confirmation with an expiry time. Type python bot.py news-list to see active blocks. Remove one early with python bot.py news-clear --symbol BTCUSDT --note "Checked the notice; not applicable". A written note is required because removing a veto lowers protection. Blocks last 1 to 168 hours and survive restarts. If you see "News veto is off", config.json is not set to option C.
+
+    Copy slot. Type python bot.py copy-status. Expected result: both fomo and astral show connected false and automatic_copying false. To measure how late a copied signal arrives, you may pass one signal you saw yourself through the same risk checks: python bot.py copy-signal --provider fomo --id any-unique-name --symbol BTCUSDT --action buy --seconds-ago 20. The seconds-ago value is how long ago the source made the trade. Signals older than 120 seconds are rejected, and the rejection is recorded. This command needs access to MEXC public data. Type python bot.py copy-report to see entries, closed trades, paper profit or loss, average delay, and rejections for each provider. Compare these with the provider's own reported results yourself. Do not give either provider your MEXC keys or your own passwords.
+
+    AUD records. Type python bot.py export-records --output records.csv --flat-rate 1.55, replacing 1.55 with a rate you have sourced. For a rate that changes by day, make a file with two columns, date and aud_per_usdt, one row per UTC date on which you traded, and use --rates rates.csv instead. The command refuses if a trading date has no rate; it never guesses. Without either option the AUD columns are blank. The file lists each buy and sell with fees, cost base, proceeds, gain, days held, and the Australian tax year, which runs 1 July to 30 June. It never overwrites an existing file. It covers only the coin legs recorded by this bot. Keep your AUD to USDT purchases and exchange statements separately. Paper trades are simulated and are not tax records. Confirm treatment with a registered tax agent.
+
+    Expected result: each command prints a result or a plain error and changes nothing else. If the copy-signal command reports that MEXC public data is unavailable, no trade was made.
+
