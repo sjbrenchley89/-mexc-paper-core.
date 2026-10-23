@@ -1,8 +1,12 @@
-"""Persistent, transactional paper ledger. No exchange order endpoint exists here."""
+"""Persistent, transactional ledger. Paper by default; live mode only records intents and exchange fills.
+
+This module never contacts an exchange. In live mode it queues order intents for live.py to submit."""
 import copy
+import hashlib
 import json
 import math
 import sqlite3
+from contextlib import closing
 from datetime import datetime, timezone
 
 TOTAL_CAP = 50.0
@@ -19,11 +23,20 @@ def finite(value):
     return isinstance(value, (float, int)) and not isinstance(value, bool) and math.isfinite(value)
 
 
+def order_id(prefix, text):
+    return prefix+hashlib.sha256(text.encode()).hexdigest()[:30]
+
+
 class Ledger:
-    def __init__(self, path, config):
-        self.path, self.config = str(path), config
+    def __init__(self, path, config, live=False):
+        self.path, self.config, self.live = str(path), config, live
 
     def initial(self, now):
+        if self.live:
+            return dict(mode='live', cash=0.0, positions={}, prices={}, day=utc_day(now), day_start=0.0,
+                        paused=False, killed=False, review_required=False, breach_day=None,
+                        floor_breached=False, seen=[], events=[], reviews=[], news_blocks=[],
+                        pending={}, synced=False)
         cash = float(self.config.get('paper_cash', 50))
         if not finite(cash) or not FLOOR <= cash <= TOTAL_CAP:
             raise ValueError('Paper cash must be between 25 and 50.')
@@ -33,7 +46,7 @@ class Ledger:
                     news_blocks=[])
 
     def transact(self, now, operation):
-        with sqlite3.connect(self.path, timeout=10) as db:
+        with closing(sqlite3.connect(self.path, timeout=10)) as db, db:
             db.execute('CREATE TABLE IF NOT EXISTS ledger (id INTEGER PRIMARY KEY, data TEXT NOT NULL)')
             db.execute('BEGIN IMMEDIATE')
             row = db.execute('SELECT data FROM ledger WHERE id=1').fetchone()
@@ -44,11 +57,14 @@ class Ledger:
 
     @staticmethod
     def equity(state):
-        return state['cash'] + sum(p['qty'] * state['prices'].get(s, p['entry_price'])
-                                   for s, p in state['positions'].items())
+        reserved = sum(o['reserved'] for o in state.get('pending', {}).values() if o['side'] == 'buy')
+        return state['cash'] + reserved + sum(p['qty'] * state['prices'].get(s, p['entry_price'])
+                                              for s, p in state['positions'].items())
 
     def limits(self, state, now):
         equity = self.equity(state)
+        if self.live and not state.get('synced'):
+            return equity
         # Check against yesterday's baseline BEFORE changing the UTC day.
         daily = min(DAILY_LIMIT, float(self.config.get('daily_loss', DAILY_LIMIT)))
         if equity <= state['day_start'] * (1 - daily):
@@ -71,7 +87,9 @@ class Ledger:
             result.update(equity=equity, daily_pnl=equity-state['day_start'],
                           daily_limit_amount=state['day_start']*daily,
                           distance_to_floor=equity-max(FLOOR, float(self.config.get('floor', FLOOR))),
-                          note='PAPER ONLY; values are USDT, assumed USD-equivalent; marks may be stale.')
+                          note=('LIVE: real money. Cash is synced from the exchange; values are USDT, assumed USD-equivalent.'
+                                if self.live else
+                                'PAPER ONLY; values are USDT, assumed USD-equivalent; marks may be stale.'))
             return result
         return self.transact(now, operation)
 
@@ -139,7 +157,20 @@ class Ledger:
         return dict(news_veto_enabled=bool(self.config.get('news')),
                     active_blocks=[b for b in blocks if b['until'] > now])
 
+    def _begin_exit(self, state, symbol, price, now, reason):
+        pending = state.setdefault('pending', {})
+        if any(o['symbol'] == symbol and o['side'] == 'sell' for o in pending.values()):
+            return
+        if now < state.get('exit_wait', {}).get(symbol, 0):
+            return
+        cid = order_id('x', f'{symbol}:{int(now*1000)}')
+        pending[cid] = dict(side='sell', symbol=symbol, qty=state['positions'][symbol]['qty'], reason=reason,
+                            ref_price=price, created=now, submitted=None)
+        self.event(state, now, kind='live_exit_intent', symbol=symbol, reason=reason, client_order_id=cid)
+
     def _sell(self, state, symbol, price, now, reason):
+        if self.live:
+            return self._begin_exit(state, symbol, price, now, reason)
         p = state['positions'].pop(symbol)
         sell_price = price * (1-float(self.config['slippage']))
         gross = p['qty']*sell_price
@@ -188,6 +219,8 @@ class Ledger:
                 return reject('scanner_disabled')
             if source == 'copy' and not self.config.get('copy_trading'):
                 return reject('copy_disabled')
+            if self.live and source in ('demo', 'backtest'):
+                return reject('simulated_source_not_allowed_live')
             if not finite(price) or price <= 0 or not finite(atr) or atr <= 0:
                 return reject('invalid_price_or_atr')
             state['prices'][symbol] = price
@@ -197,16 +230,19 @@ class Ledger:
                     return reject('no_bot_position')
                 self._sell(state, symbol, price, now, 'signal')
                 self.limits(state, now)
-                return dict(accepted=True, mode='paper', action='sell')
+                return dict(accepted=True, mode='live' if self.live else 'paper', action='sell')
             if state['paused'] or state['killed'] or state['review_required']:
                 return reject('safety_halt')
             if self.config.get('news') and any(b['symbol'] in (symbol, '*') and b['until'] > now
                                                 for b in state.get('news_blocks', [])):
                 return reject('news_veto')
-            if symbol in state['positions']:
+            buying = {o['symbol']: o for o in state.get('pending', {}).values() if o['side'] == 'buy'}
+            if symbol in state['positions'] or symbol in buying:
                 return reject('position_already_open')
-            if len(state['positions']) >= min(5, int(self.config['max_positions'])):
+            if len(state['positions'])+len(buying) >= min(5, int(self.config['max_positions'])):
                 return reject('max_positions')
+            if self.live and not state.get('synced'):
+                return reject('not_synced_with_exchange')
             if source == 'copy' and source_time is None:
                 return reject('copy_requires_source_time')
             if source_time is not None and (not finite(source_time) or not 0 <= now-source_time <= 120):
@@ -222,7 +258,8 @@ class Ledger:
             # Include estimated fees on both sides and adverse entry/exit slippage.
             unit_loss = fill_price*(1+fee)-stop*(1-slip)*(1-fee)
             risk_cash = equity*min(0.01, float(self.config['risk_per_trade']))
-            allocated = sum(p['cost'] for p in state['positions'].values())
+            allocated = (sum(p['cost'] for p in state['positions'].values())
+                         + sum(o['reserved'] for o in buying.values()))
             total_cap = min(TOTAL_CAP, float(self.config['total_cap']))
             position_cap = min(POSITION_CAP, float(self.config['position_cap']))
             # Leave 5% headroom for appreciation before the marked exposure cap.
@@ -239,6 +276,20 @@ class Ledger:
             cost = qty*fill_price*(1+fee)
             if cost <= 0 or cost < float(self.config['min_paper_order']):
                 return reject('order_too_small')
+            if self.live:
+                quote = math.floor(qty*fill_price*100)/100
+                if quote < max(1.0, liquidity['min_notional']):
+                    return reject('order_too_small')
+                cid = order_id('b', signal_id)
+                state['cash'] -= cost
+                state['pending'][cid] = dict(side='buy', symbol=symbol, quote=quote, reserved=cost, stop=stop,
+                    take_profit=price+4*atr, source=source, strategy=strategy, signal_id=signal_id,
+                    ref_price=price, created=now, submitted=None,
+                    latency=None if source_time is None else now-source_time)
+                self.event(state, now, kind='live_entry_intent', id=signal_id, symbol=symbol, quote=quote,
+                           source=source, strategy=strategy, client_order_id=cid)
+                return dict(accepted=True, mode='live', action='buy', pending=True, client_order_id=cid,
+                            quote_order_qty=quote, cost=cost, qty=qty)
             state['cash'] -= cost
             state['positions'][symbol] = dict(qty=qty, entry_price=fill_price, cost=cost,
                 stop=stop, take_profit=price+4*atr, source=source, strategy=strategy)
@@ -247,4 +298,139 @@ class Ledger:
                 latency=None if source_time is None else now-source_time)
             self.limits(state, now)
             return dict(accepted=True, mode='paper', action='buy', cost=cost, qty=qty)
+        return self.transact(now, operation)
+
+    def auto_block(self, symbol, reason, now):
+        if not self.config.get('news'):
+            return False
+        def operation(state):
+            blocks = [b for b in state.setdefault('news_blocks', []) if b['until'] > now]
+            state['news_blocks'] = blocks
+            if any(b['symbol'] == symbol and b.get('auto') and b['until'] > now+1800 for b in blocks):
+                return False
+            blocks.append(dict(symbol=symbol, created=now, until=now+3600, reason='AUTO: '+reason[:190], auto=True))
+            self.event(state, now, kind='news_block', symbol=symbol, until=now+3600, reason='AUTO: '+reason[:190])
+            return True
+        return self.transact(now, operation)
+
+    def live_outbox(self, now):
+        return self.transact(now, lambda state: copy.deepcopy(state.get('pending', {})))
+
+    def _pending(self, state, cid, side):
+        order = state.get('pending', {}).get(cid)
+        if order is None or order['side'] != side:
+            raise ValueError('Unknown pending order.')
+        return state['pending'].pop(cid)
+
+    def live_submitted(self, cid, now):
+        def operation(state):
+            order = state.get('pending', {}).get(cid)
+            if order is None:
+                raise ValueError('Unknown pending order.')
+            order['submitted'] = now
+            self.event(state, now, kind='live_submitted', client_order_id=cid, symbol=order['symbol'], side=order['side'])
+        return self.transact(now, operation)
+
+    def live_release(self, cid, reason, now):
+        def operation(state):
+            order = state.get('pending', {}).pop(cid, None)
+            if order is None:
+                raise ValueError('Unknown pending order.')
+            if order['side'] == 'buy':
+                state['cash'] += order['reserved']
+            else:
+                fails = state.setdefault('exit_fails', {}).get(order['symbol'], 0)+1
+                state['exit_fails'][order['symbol']] = fails
+                state.setdefault('exit_wait', {})[order['symbol']] = now+min(600, 15*2**fails)
+                if fails == 5:
+                    state.update(paused=True, review_required=True)
+                    self.event(state, now, kind='live_halt', reason=f"{order['symbol']} exit failed {fails} times")
+            self.event(state, now, kind='live_released', client_order_id=cid, symbol=order['symbol'],
+                       side=order['side'], reason=reason[:200])
+            self.limits(state, now)
+        return self.transact(now, operation)
+
+    def live_settle_buy(self, cid, qty, quote_spent, fee_value, fee_cash, now):
+        def operation(state):
+            order = self._pending(state, cid, 'buy')
+            state['cash'] += order['reserved']
+            symbol = order['symbol']
+            if not (finite(qty) and finite(quote_spent) and qty > 0 and quote_spent > 0):
+                self.event(state, now, kind='live_released', client_order_id=cid, symbol=symbol,
+                           side='buy', reason='nothing filled')
+                return dict(filled=False)
+            state['cash'] -= quote_spent+fee_cash
+            state['positions'][symbol] = dict(qty=qty, entry_price=quote_spent/qty, cost=quote_spent+fee_value,
+                stop=order['stop'], take_profit=order['take_profit'], source=order['source'],
+                strategy=order['strategy'])
+            self.event(state, now, kind='fill', action='buy', id=order['signal_id'], symbol=symbol,
+                price=quote_spent/qty, qty=qty, fee=fee_value, source=order['source'],
+                strategy=order['strategy'], latency=order['latency'], client_order_id=cid, mode='live')
+            self.limits(state, now)
+            return dict(filled=True, qty=qty)
+        return self.transact(now, operation)
+
+    def live_settle_sell(self, cid, qty, quote_received, fee_value, fee_cash, now):
+        def operation(state):
+            order = self._pending(state, cid, 'sell')
+            symbol = order['symbol']
+            position = state['positions'].get(symbol)
+            if position is None or not (finite(qty) and finite(quote_received) and qty > 0 and quote_received > 0):
+                self.event(state, now, kind='live_released', client_order_id=cid, symbol=symbol,
+                           side='sell', reason='nothing sold')
+                return dict(filled=False)
+            remaining = position['qty']-qty
+            last = state['prices'].get(symbol, quote_received/qty)
+            closing = remaining*last < 1.0
+            cost_part = position['cost'] if closing else position['cost']*qty/position['qty']
+            proceeds = quote_received-fee_value
+            state['cash'] += quote_received-fee_cash
+            state.get('exit_fails', {}).pop(symbol, None)
+            state.get('exit_wait', {}).pop(symbol, None)
+            self.event(state, now, kind='fill', action='sell', symbol=symbol, strategy=position['strategy'],
+                source=position['source'], qty=qty, price=quote_received/qty, fee=fee_value,
+                pnl=proceeds-cost_part, reason=order['reason'], client_order_id=cid, mode='live')
+            if closing:
+                del state['positions'][symbol]
+            else:
+                position['qty'], position['cost'] = remaining, position['cost']-cost_part
+            self.limits(state, now)
+            return dict(filled=True, qty=qty, closed=closing)
+        return self.transact(now, operation)
+
+    def live_write_off_dust(self, symbol, now):
+        def operation(state):
+            position = state['positions'].pop(symbol, None)
+            if position is None:
+                return False
+            self.event(state, now, kind='dust_written_off', symbol=symbol, qty=position['qty'],
+                       cost=position['cost'], reason='below exchange minimum order; cannot be sold')
+            return True
+        return self.transact(now, operation)
+
+    def live_acquire(self, token, now):
+        def operation(state):
+            lock = state.get('lock')
+            if lock and lock['token'] != token and now-lock['heartbeat'] < 30:
+                raise ValueError('Another live process is already running on this ledger.')
+            state['lock'] = dict(token=token, heartbeat=now)
+        return self.transact(now, operation)
+
+    def live_halt(self, reason, now):
+        def operation(state):
+            state.update(paused=True, review_required=True)
+            self.event(state, now, kind='live_halt', reason=reason[:300])
+        return self.transact(now, operation)
+
+    def live_sync(self, usdt_total, problems, now):
+        def operation(state):
+            if not state.get('pending'):
+                state['cash'] = usdt_total
+            if not state.get('synced'):
+                state.update(synced=True, day=utc_day(now), day_start=usdt_total)
+            equity = self.limits(state, now)
+            if problems and not state['review_required']:
+                state.update(paused=True, review_required=True)
+                self.event(state, now, kind='live_halt', reason='; '.join(problems)[:300])
+            return equity
         return self.transact(now, operation)

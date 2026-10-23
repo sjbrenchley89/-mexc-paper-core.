@@ -13,24 +13,32 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import copytrade
+import exchange
+import live
 import market
 import records
 from risk import Ledger, finite
 from strategies import evaluate, indicators
 
 ROOT = Path(__file__).resolve().parent
+LIVE_COMMANDS = {'status', 'pause', 'resume', 'kill', 'review-rearm', 'news-list', 'news-block', 'news-clear',
+                 'copy-report', 'export-records'}
 
 
 def load_config(path):
     config = json.loads(Path(path).read_text())
     if config['mode'] != 'paper':
-        raise ValueError('Stage 1 is PAPER ONLY. Live execution is not implemented or enabled.')
+        raise ValueError('config.json must say mode paper (PAPER ONLY). Real trading starts only with live-start after live-preflight passes.')
     if config['option'] not in ('A', 'B', 'C'):
         raise ValueError('Option must be A, B or C.')
     if config['news'] is not (config['option'] == 'C'):
         raise ValueError('News veto is part of option C: news must be true for C and false for A or B.')
     if type(config['copy_trading']) is not bool:
         raise ValueError('copy_trading must be true or false.')
+    confirmations = config.get('live', {})
+    if not isinstance(confirmations, dict) or set(confirmations) - {'mexc_eligibility_confirmed', 'trade_only_key_confirmed'} \
+            or any(type(v) is not bool for v in confirmations.values()):
+        raise ValueError('live must contain only true/false values for mexc_eligibility_confirmed and trade_only_key_confirmed.')
     if config['tradovate'] or config['portal_strategies']:
         raise ValueError('Tradovate and portal strategies are not implemented; keep them disabled.')
     for name in ('total_cap','position_cap','floor','risk_per_trade','daily_loss','fee','slippage','min_paper_order'):
@@ -88,7 +96,21 @@ def process_alert(payload, token, ledger, config, now):
                          'tradingview', 'technical', now, payload['sent_at'], liquid)
 
 
-def serve(ledger, config, port):
+def auto_status_veto(ledger, config, market_data, now):
+    blocked = []
+    if not config['news']:
+        return blocked
+    for symbol in config['symbols']:
+        try:
+            status = market_data.trading_status(symbol)
+        except Exception:
+            continue
+        if not status['ok'] and ledger.auto_block(symbol, f"exchange status {status['status']}: not online", now):
+            blocked.append(symbol)
+    return blocked
+
+
+def serve(ledger, config, port, executor=None):
     token = load_secrets()
     stop = threading.Event()
     class Handler(BaseHTTPRequestHandler):
@@ -151,9 +173,25 @@ def serve(ledger, config, port):
             else:
                 stop.wait(1)
 
-    def monitor():
+    def trader():
         while not stop.is_set():
             try:
+                executor.cycle(time.time())
+            except Exception as exc:
+                print(json.dumps({'live_cycle_error': type(exc).__name__}), flush=True)
+            if executor.stopped:
+                stop.set()
+                server.shutdown()
+            stop.wait(5)
+
+    def monitor():
+        last_status_check = 0.0
+        while not stop.is_set():
+            try:
+                if time.time()-last_status_check >= 300:
+                    last_status_check = time.time()
+                    for symbol in auto_status_veto(ledger, config, market, time.time()):
+                        print(json.dumps({'auto_veto': symbol, 'reason': 'exchange status not online'}), flush=True)
                 state = ledger.status(time.time())
                 quotes = {symbol:market.price(symbol) for symbol in state['positions']}
                 ledger.mark(quotes, time.time())
@@ -173,7 +211,11 @@ def serve(ledger, config, port):
     server = ThreadingHTTPServer(('127.0.0.1', port), Handler)
     threading.Thread(target=worker, daemon=True).start()
     threading.Thread(target=monitor, daemon=True).start()
-    print(f'PAPER ONLY. Webhook: http://127.0.0.1:{port}/webhook. No real orders or exchange keys.')
+    if executor:
+        threading.Thread(target=trader, daemon=True).start()
+        print(f'LIVE TRADING WITH REAL MONEY. Webhook: http://127.0.0.1:{port}/webhook. Kill switch: python bot.py --live kill')
+    else:
+        print(f'PAPER ONLY. Webhook: http://127.0.0.1:{port}/webhook. No real orders or exchange keys.')
     if config['news']:
         print('NEWS VETO ON: it blocks only the entries you record with news-block. No news provider is connected.')
     if config['copy_trading']:
@@ -240,12 +282,34 @@ def backtest(path, strategy, config):
                     assumptions='USDT~USD; synthetic liquidity; no exchange filters or intrabar ticks. Not live qualification.')
 
 
+def confirm_live(read=input):
+    print('REAL MONEY WARNING. This starts automatic trading on your MEXC account, up to 50 USD total and 10 USD per position.')
+    print('You can lose all of it. Nothing here is a promise of profit. Local stop-losses only work while this program runs.')
+    print(f'To continue, type exactly: {live.PHRASE}')
+    try:
+        typed = read('> ')
+    except EOFError:
+        typed = ''
+    if typed.strip() != live.PHRASE:
+        raise ValueError('Confirmation phrase not typed exactly; live trading was not started.')
+
+
+def live_checks(config, args, now):
+    keys = bool(os.environ.get('MEXC_API_KEY')) and bool(os.environ.get('MEXC_API_SECRET'))
+    client = exchange.MexcClient.from_env() if keys else None
+    paper_state = Ledger(args.paper_state, config).status(now)
+    checks, ready = live.preflight(config, client, market, paper_state, now, keys)
+    return client, checks, ready
+
+
 def main():
-    parser = argparse.ArgumentParser(description='MEXC paper core. Live execution is unavailable.')
+    parser = argparse.ArgumentParser(description='MEXC bot. Paper by default; live trading needs live-start.')
     parser.add_argument('--config', default=str(ROOT/'config.json'))
-    parser.add_argument('--state', default=str(ROOT/'paper.sqlite'))
+    parser.add_argument('--state', default=None, help='ledger file; defaults to paper.sqlite, or live.sqlite with --live')
+    parser.add_argument('--live', action='store_true', help='use the live ledger for status and safety controls')
     sub = parser.add_subparsers(dest='command', required=True)
-    for name in ('init','status','pause','resume','kill','demo','setup','scan','news-list','copy-status','copy-report'):
+    for name in ('init','status','pause','resume','kill','demo','setup','scan','news-list','copy-status','copy-report',
+                 'live-preflight'):
         sub.add_parser(name)
     block = sub.add_parser('news-block')
     block.add_argument('--symbol', required=True, help='an allowed symbol such as BTCUSDT, or * for all')
@@ -268,6 +332,8 @@ def main():
     review.add_argument('--note', required=True)
     start = sub.add_parser('start')
     start.add_argument('--port', type=int, default=8787)
+    live_start = sub.add_parser('live-start')
+    live_start.add_argument('--port', type=int, default=8787)
     test = sub.add_parser('backtest')
     test.add_argument('--csv', required=True)
     test.add_argument('--strategy', choices=('technical','breakout'), required=True)
@@ -276,7 +342,11 @@ def main():
     args = parser.parse_args()
     try:
         config = load_config(args.config)
-        ledger = Ledger(args.state, config)
+        args.paper_state = args.state if args.state and not args.live else str(ROOT/'paper.sqlite')
+        args.state = args.state or str(ROOT/('live.sqlite' if args.live else 'paper.sqlite'))
+        if args.live and args.command not in LIVE_COMMANDS:
+            raise ValueError('--live only applies to status, safety controls, news veto and records; use live-start to trade.')
+        ledger = Ledger(args.state, config, live=args.live)
         if args.command in ('init','status'):
             result = ledger.status(time.time())
             if args.command == 'init':
@@ -314,6 +384,22 @@ def main():
             result = {'created':str(path),'next':'Copy only WEBHOOK_SECRET from this private file into your own TradingView alert. Never paste exchange keys into alerts.'}
         elif args.command == 'start':
             serve(ledger, config, args.port)
+            return
+        elif args.command == 'live-preflight':
+            _, checks, ready = live_checks(config, args, time.time())
+            result = dict(ready=ready, checks=checks, nothing_was_traded=True)
+        elif args.command == 'live-start':
+            load_secrets()
+            now = time.time()
+            client, checks, ready = live_checks(config, args, now)
+            if not ready:
+                print(json.dumps(dict(ready=False, checks=checks), indent=2))
+                raise ValueError('Live preflight failed; live trading was not started.')
+            confirm_live()
+            live_ledger = Ledger(str(ROOT/'live.sqlite'), config, live=True)
+            executor = live.Executor(live_ledger, client, config, market, log=lambda m: print(json.dumps(m), flush=True))
+            executor.cycle(time.time())
+            serve(live_ledger, config, args.port, executor)
             return
         elif args.command == 'scan':
             result = {'candidates':market.scan(config['symbols']),'orders_placed':False}

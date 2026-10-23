@@ -11,6 +11,9 @@ COLUMNS = ['date_utc', 'tax_year', 'mode', 'type', 'symbol', 'quantity', 'price_
 NOTE = ('Paper trades are simulated and are not tax records. For real trades, keep AUD values, '
         'your AUD to USDT purchases, transfers and exchange statements as well. Confirm treatment '
         'with a registered tax agent.')
+LIVE_NOTE = ('Built from the bot\'s own record of exchange fills. Fees paid in other coins are estimated, and '
+             'your exchange statements remain the official record. Keep your AUD to USDT purchases and '
+             'transfers separately. Confirm treatment with a registered tax agent.')
 
 
 def utc(timestamp):
@@ -100,4 +103,5 @@ def export(state, output, rates_path=None, flat_rate=None):
             if year['gain_aud'] is not None:
                 year['gain_aud'] += row['gain_aud']
     return dict(saved=str(output), rows=len(rows), aud_values_included=has_aud,
-                gain_by_tax_year=totals, open_positions_not_included=sorted(open_buys), note=NOTE)
+                gain_by_tax_year=totals, open_positions_not_included=sorted(open_buys),
+                note=LIVE_NOTE if state['mode'] == 'live' else NOTE)

@@ -15,5 +15,6 @@
   "copy_trading": true,
   "tradovate": false,
   "portal_strategies": false,
-  "news": true
+  "news": true,
+  "live": {"mexc_eligibility_confirmed": false, "trade_only_key_confirmed": false}
 }
