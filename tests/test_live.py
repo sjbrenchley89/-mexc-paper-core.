@@ -563,3 +563,98 @@ class HardeningTests(Base):
     def test_stale_lock_can_be_taken_over(self):
         other = live.Executor(self.ledger, self.client, self.config, self.market, log=self.logs.append)
         self.assertEqual(other.cycle(self.now+31), 'ok')
+
+
+class ReviewFixTests(Base):
+    def test_ledger_file_mode_must_match_the_instance(self):
+        self.buy()
+        self.tick()
+        paper_view = Ledger(self.dir/'live.sqlite', self.config)
+        with self.assertRaisesRegex(ValueError, 'live ledger'):
+            paper_view.mark({'BTCUSDT': 85.0}, self.now+1)
+        self.assertIn('BTCUSDT', self.state()['positions'])
+        Ledger(self.dir/'paper.sqlite', self.config).status(NOW)
+        with self.assertRaisesRegex(ValueError, 'paper ledger'):
+            Ledger(self.dir/'paper.sqlite', self.config, live=True).status(NOW)
+
+    def test_rate_limit_while_reading_trade_history_backs_off(self):
+        self.buy()
+        original = self.client.my_trades
+        self.client.my_trades = lambda s, o: (_ for _ in ()).throw(exchange.RateLimited(120))
+        self.assertEqual(self.tick(), 'rate_limited')
+        self.assertEqual(len(self.state()['pending']), 1)
+        self.assertEqual(self.tick(60), 'rate_limited')
+        self.client.my_trades = original
+        self.assertEqual(self.tick(61), 'ok')
+        self.assertIn('BTCUSDT', self.state()['positions'])
+        self.assertEqual(len(self.client.sent), 1)
+
+    def test_rate_limit_while_cancelling_backs_off(self):
+        self.buy()
+        self.client.on_new = 'lost'
+        self.tick()
+        self.client.orders['x'] = None
+        self.client.query_order = lambda s, c: dict(status='NEW')
+        self.client.cancel_order = lambda s, c: (_ for _ in ()).throw(exchange.RateLimited(90))
+        self.assertEqual(self.tick(live.WORKING_CANCEL+1), 'rate_limited')
+        self.assertEqual(self.tick(30), 'rate_limited')
+
+    def test_old_unsubmitted_buy_is_dropped_not_sent(self):
+        self.buy()
+        self.assertEqual(self.tick(live.INTENT_MAX_AGE+1), 'ok')
+        self.assertEqual(self.client.sent, [])
+        state = self.state()
+        self.assertEqual((state['cash'], state['pending']), (50.0, {}))
+
+    def test_fresh_buy_intent_still_sent(self):
+        self.buy()
+        self.tick(live.INTENT_MAX_AGE-1)
+        self.assertEqual(len(self.client.sent), 1)
+
+    def test_holding_that_cannot_be_valued_halts_trading(self):
+        self.client.balances['ZZZ'] = 5.0
+        self.tick()
+        self.assertTrue(self.state()['review_required'])
+        reasons = [e['reason'] for e in self.state()['events'] if e['kind'] == 'live_halt']
+        self.assertIn('unvalued holding ZZZ', reasons[0])
+
+    def test_outage_pricing_an_allowed_coin_does_not_halt(self):
+        self.buy()
+        self.tick()
+        original = self.market.price
+        self.market.price = lambda symbol: (_ for _ in ()).throw(RuntimeError('network'))
+        self.tick()
+        self.market.price = original
+        self.assertFalse(self.state()['review_required'])
+
+
+class PartialSaleRecordTests(Base):
+    def test_export_allocates_cost_across_partial_sales(self):
+        import csv
+        import records
+        result = self.buy()
+        self.tick()
+        position = self.state()['positions']['BTCUSDT']
+        cost, qty = position['cost'], position['qty']
+        for part, price in ((0.4, 97.0), (0.6, 96.0)):
+            self.now += 20
+            self.market.last = price
+            self.ledger.mark({'BTCUSDT': price}, self.now)
+            pending = self.ledger.live_outbox(self.now)
+            cid = next(iter(pending))
+            sold = qty*part
+            self.ledger.live_settle_sell(cid, sold, sold*price, sold*price*.0005, sold*price*.0005, self.now)
+        self.assertEqual(self.state()['positions'], {})
+        output = self.dir/'records.csv'
+        records.export(self.state(), output, flat_rate=1.5)
+        with open(output, newline='') as file:
+            sells = [r for r in csv.DictReader(file) if r['type'] == 'sell']
+        self.assertEqual(len(sells), 2)
+        self.assertAlmostEqual(sum(float(r['cost_base_usdt']) for r in sells), cost, places=6)
+        self.assertAlmostEqual(float(sells[0]['cost_base_usdt'])/cost, 0.4, places=6)
+        self.assertAlmostEqual(float(sells[1]['cost_base_aud']), float(sells[1]['cost_base_usdt'])*1.5)
+
+
+if __name__ == '__main__':
+    unittest.main()
+

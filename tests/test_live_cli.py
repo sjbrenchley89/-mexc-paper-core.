@@ -1,9 +1,12 @@
 import contextlib
 import copy
+import http.client
 import io
 import json
 import tempfile
+import threading
 import unittest
+from http.server import ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
 
@@ -137,10 +140,41 @@ class CommandTests(unittest.TestCase):
             self.assertIn('Paper trial length', failed)
 
     def test_live_start_refuses_when_preflight_fails(self):
-        with tempfile.TemporaryDirectory() as directory, patch.dict('os.environ', {}, clear=True):
-            code, _ = self.run_cli('--state', str(Path(directory)/'paper.sqlite'), 'live-start')
+        with tempfile.TemporaryDirectory() as directory, patch.dict('os.environ', {'WEBHOOK_SECRET': 'x'*40}, clear=True):
+            code, out = self.run_cli('--state', str(Path(directory)/'paper.sqlite'), 'live-start')
             self.assertEqual(code, 1)
+            self.assertIn('"ready": false', out)
             self.assertFalse((bot.ROOT/'live.sqlite').exists())
+
+
+class ServerModeTests(unittest.TestCase):
+    def request(self, ledger, method, path, body=None):
+        server = ThreadingHTTPServer(('127.0.0.1', 0), bot.make_handler(ledger, 'secret-token-0123456789'))
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            connection = http.client.HTTPConnection('127.0.0.1', server.server_address[1], timeout=5)
+            connection.request(method, path, body=json.dumps(body) if body is not None else None)
+            reply = connection.getresponse()
+            return reply.status, json.loads(reply.read())
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_health_reports_the_real_mode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paper = Ledger(Path(directory)/'p.sqlite', CONFIG)
+            real = Ledger(Path(directory)/'l.sqlite', CONFIG, live=True)
+            self.assertEqual(self.request(paper, 'GET', '/health'), (200, {'mode': 'paper', 'live_enabled': False}))
+            self.assertEqual(self.request(real, 'GET', '/health'), (200, {'mode': 'live', 'live_enabled': True}))
+
+    def test_webhook_acknowledgement_reports_the_real_mode(self):
+        alert = dict(secret='secret-token-0123456789', id='a', symbol='BTCUSDT', action='buy')
+        with tempfile.TemporaryDirectory() as directory:
+            real = Ledger(Path(directory)/'l.sqlite', CONFIG, live=True)
+            status, data = self.request(real, 'POST', '/webhook', alert)
+            self.assertEqual((status, data['mode'], data['filled']), (202, 'live', False))
+            status, _ = self.request(real, 'POST', '/webhook', dict(alert, secret='wrong-wrong-wrong-wrong-0000'))
+            self.assertEqual(status, 401)
 
 
 if __name__ == '__main__':

@@ -8,6 +8,7 @@ from risk import FLOOR, TOTAL_CAP
 
 QUOTE = 'USDT'
 MAX_ADVERSE_MOVE = 0.005
+INTENT_MAX_AGE = 120
 NOT_FOUND_GRACE = 15
 UNRESOLVED_HALT = 120
 WORKING_CANCEL = 60
@@ -169,6 +170,8 @@ class Executor:
             except Exception:
                 price = None
             if price is None:
+                if idle and symbol is None:
+                    problems.append(f'unvalued holding {asset}')
                 continue
             value += amount*price
             if idle and symbol is None and amount*price >= DUST_VALUE:
@@ -199,6 +202,9 @@ class Executor:
     def _submit(self, cid, order, now):
         symbol = order['symbol']
         if order['side'] == 'buy':
+            if now-order['created'] > INTENT_MAX_AGE:
+                self.ledger.live_release(cid, 'entry signal expired before submission', now)
+                return False
             state = self.ledger.status(now)
             if state['paused'] or state['killed'] or state['review_required']:
                 self.ledger.live_release(cid, 'trading was halted before submission', now)
@@ -255,6 +261,8 @@ class Executor:
             if waited > WORKING_CANCEL:
                 try:
                     self.client.cancel_order(symbol, cid)
+                except exchange.RateLimited:
+                    raise
                 except (exchange.ExchangeError, exchange.Uncertain):
                     self._unresolved(cid, waited, now, 'could not cancel a working order')
             return
@@ -272,6 +280,8 @@ class Executor:
         quote_amount = number(found.get('cumulativeQuoteQty', found.get('cummulativeQuoteQty')))
         try:
             trades = self.client.my_trades(symbol, found.get('orderId'))
+        except exchange.RateLimited:
+            raise
         except (exchange.ExchangeError, exchange.Uncertain):
             trades = []
         if not isinstance(trades, list) or not trades:

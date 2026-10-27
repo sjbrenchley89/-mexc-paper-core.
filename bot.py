@@ -69,6 +69,10 @@ def load_secrets():
     return token
 
 
+def mode_of(ledger):
+    return 'live' if ledger.live else 'paper'
+
+
 def process_alert(payload, token, ledger, config, now):
     allowed = {'secret','id','symbol','action','strategy','timeframe','sent_at','candle_time'}
     if not isinstance(payload, dict) or set(payload) != allowed:
@@ -88,7 +92,7 @@ def process_alert(payload, token, ledger, config, now):
         raise ValueError('Alert does not reference the latest closed MEXC one-hour candle.')
     action, i = evaluate(bars, 'technical')
     if action != payload['action']:
-        return {'accepted':False, 'reason':'technical_confirmation_failed', 'mode':'paper'}
+        return {'accepted':False, 'reason':'technical_confirmation_failed', 'mode':mode_of(ledger)}
     quote = market.price(payload['symbol'])
     ledger.mark({payload['symbol']:quote}, now)
     liquid = market.liquidity(payload['symbol']) if action == 'buy' else None
@@ -110,9 +114,7 @@ def auto_status_veto(ledger, config, market_data, now):
     return blocked
 
 
-def serve(ledger, config, port, executor=None):
-    token = load_secrets()
-    stop = threading.Event()
+def make_handler(ledger, token):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_):
             pass  # Never log payloads, tokens, or query strings.
@@ -125,9 +127,9 @@ def serve(ledger, config, port, executor=None):
             self.wfile.write(raw)
         def do_GET(self):
             if self.path == '/health':
-                self.reply(200, {'mode':'paper','live_enabled':False})
+                self.reply(200, {'mode':mode_of(ledger),'live_enabled':ledger.live})
             else:
-                self.reply(404, {'error':'No dashboard or remote control endpoint in stage 1.'})
+                self.reply(404, {'error':'No dashboard or remote control endpoint exists.'})
         def do_POST(self):
             if self.path != '/webhook':
                 return self.reply(404, {'error':'Unknown endpoint.'})
@@ -151,12 +153,17 @@ def serve(ledger, config, port, executor=None):
                         raise ValueError('Queue full; no alert accepted.')
                     queued.append(payload)
                 ledger.transact(time.time(), enqueue)
-                self.reply(202, {'queued':True,'mode':'paper','filled':False})
+                self.reply(202, {'queued':True,'mode':mode_of(ledger),'filled':False})
             except PermissionError:
                 self.reply(401, {'error':'Authentication failed.'})
             except (ValueError, TypeError, TimeoutError, json.JSONDecodeError):
                 self.reply(400, {'error':'Invalid request; no trade performed.'})
+    return Handler
 
+
+def serve(ledger, config, port, executor=None):
+    token = load_secrets()
+    stop = threading.Event()
     def worker():
         while not stop.is_set():
             def dequeue(state):
@@ -169,7 +176,7 @@ def serve(ledger, config, port, executor=None):
                     result = process_alert(payload, token, ledger, config, time.time())
                     print(json.dumps(result), flush=True)
                 except Exception as exc:
-                    print(json.dumps({'alert_rejected':type(exc).__name__, 'mode':'paper'}), flush=True)
+                    print(json.dumps({'alert_rejected':type(exc).__name__, 'mode':mode_of(ledger)}), flush=True)
             else:
                 stop.wait(1)
 
@@ -208,7 +215,7 @@ def serve(ledger, config, port, executor=None):
                 print(json.dumps({'market_data_error':type(exc).__name__, 'entries_unavailable':True}), flush=True)
             stop.wait(15 if config['option'] == 'A' else 60)
 
-    server = ThreadingHTTPServer(('127.0.0.1', port), Handler)
+    server = ThreadingHTTPServer(('127.0.0.1', port), make_handler(ledger, token))
     threading.Thread(target=worker, daemon=True).start()
     threading.Thread(target=monitor, daemon=True).start()
     if executor:

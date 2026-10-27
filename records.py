@@ -75,17 +75,21 @@ def export(state, output, rates_path=None, flat_rate=None):
                    price_usdt=e['price'], gross_usdt=gross, fee_usdt=e['fee'], strategy=e['strategy'],
                    source=e['source'], aud_per_usdt='' if rate is None else rate)
         if e['action'] == 'buy':
-            open_buys[e['symbol']] = dict(time=e['timestamp'], cost=gross+e['fee'], rate=rate)
+            open_buys[e['symbol']] = dict(time=e['timestamp'], qty=e['qty'], rate=rate)
         else:
-            buy = open_buys.pop(e['symbol'], None)
+            buy = open_buys.get(e['symbol'])
             if buy is None:
                 raise ValueError('Ledger has a sale with no matching purchase; export stopped.')
             proceeds = gross-e['fee']
+            cost_base = proceeds-e['pnl']
             days = (e['timestamp']-buy['time'])/86400
-            row.update(reason=e['reason'], cost_base_usdt=buy['cost'], proceeds_usdt=proceeds,
-                       gain_usdt=proceeds-buy['cost'], days_held=round(days, 4),
+            buy['qty'] -= e['qty']
+            if buy['qty']*e['price'] < 1.0:
+                del open_buys[e['symbol']]
+            row.update(reason=e['reason'], cost_base_usdt=cost_base, proceeds_usdt=proceeds,
+                       gain_usdt=e['pnl'], days_held=round(days, 4),
                        held_over_12_months='yes' if days > 366 else 'no',
-                       cost_base_aud=aud(buy['cost'], buy['rate']), proceeds_aud=aud(proceeds, rate))
+                       cost_base_aud=aud(cost_base, buy['rate']), proceeds_aud=aud(proceeds, rate))
             if rate is not None:
                 row['gain_aud'] = row['proceeds_aud']-row['cost_base_aud']
         row.update(gross_aud=aud(gross, rate), fee_aud=aud(e['fee'], rate))

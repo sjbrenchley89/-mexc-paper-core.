@@ -51,6 +51,8 @@ class Ledger:
             db.execute('BEGIN IMMEDIATE')
             row = db.execute('SELECT data FROM ledger WHERE id=1').fetchone()
             state = json.loads(row[0]) if row else self.initial(now)
+            if state['mode'] != ('live' if self.live else 'paper'):
+                raise ValueError(f"This ledger file is a {state['mode']} ledger; use {'--live' if state['mode'] == 'live' else 'the paper ledger'} for it.")
             result = operation(state)
             db.execute('INSERT OR REPLACE INTO ledger VALUES (1,?)', (json.dumps(state, allow_nan=False),))
             return result
