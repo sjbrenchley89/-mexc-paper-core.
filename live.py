@@ -32,7 +32,7 @@ class ProcessLock:
         handle = open(self.path, 'a+b')
         try:
             if os.name == 'nt':
-                import msvcrt
+                import msvcrt  # pylint: disable=import-error
                 handle.seek(0)
                 msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
             else:
