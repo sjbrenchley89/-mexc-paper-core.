@@ -161,6 +161,7 @@ class Ledger:
 
     def _begin_exit(self, state, symbol, price, now, reason):
         pending = state.setdefault('pending', {})
+        state.setdefault('exit_wanted', {}).setdefault(symbol, reason)
         if any(o['symbol'] == symbol and o['side'] == 'sell' for o in pending.values()):
             return
         if now < state.get('exit_wait', {}).get(symbol, 0):
@@ -196,7 +197,9 @@ class Ledger:
                     continue
                 price = quotes[symbol]
                 cap = min(POSITION_CAP, float(self.config['position_cap']))
-                if state['review_required'] or price <= p['stop'] or price >= p['take_profit'] or p['qty']*price > cap:
+                if self.live and symbol in state.get('exit_wanted', {}):
+                    self._sell(state, symbol, price, now, state['exit_wanted'][symbol])
+                elif state['review_required'] or price <= p['stop'] or price >= p['take_profit'] or p['qty']*price > cap:
                     reason = ('safety_halt' if state['review_required'] else 'stop' if price <= p['stop']
                               else 'take_profit' if price >= p['take_profit'] else 'exposure_cap')
                     self._sell(state, symbol, price, now, reason)
@@ -234,7 +237,20 @@ class Ledger:
             equity = self.limits(state, now)
             if action == 'sell':
                 if symbol not in state['positions']:
-                    return reject('no_bot_position')
+                    buying = [(cid, o) for cid, o in state.get('pending', {}).items()
+                              if self.live and o['symbol'] == symbol and o['side'] == 'buy']
+                    if not buying:
+                        return reject('no_bot_position')
+                    cid, order = buying[0]
+                    if order['submitted'] is None:
+                        del state['pending'][cid]
+                        state['cash'] += order['reserved']
+                        self.event(state, now, kind='live_released', client_order_id=cid, symbol=symbol,
+                                   side='buy', reason='sell signal before submission')
+                        return dict(accepted=True, mode='live', action='sell', cancelled_pending_buy=True)
+                    state.setdefault('exit_wanted', {})[symbol] = 'signal'
+                    self.event(state, now, kind='live_exit_deferred', symbol=symbol, id=signal_id)
+                    return dict(accepted=True, mode='live', action='sell', deferred=True)
                 self._sell(state, symbol, price, now, 'signal')
                 self.limits(state, now)
                 return dict(accepted=True, mode='live' if self.live else 'paper', action='sell')
@@ -286,6 +302,7 @@ class Ledger:
                 if quote < max(1.0, liquidity['min_notional']):
                     return reject('order_too_small')
                 cid = order_id('b', signal_id)
+                state.get('exit_wanted', {}).pop(symbol, None)
                 state['cash'] -= cost
                 state['pending'][cid] = dict(side='buy', symbol=symbol, quote=quote, reserved=cost, stop=stop,
                     take_profit=price+4*atr, source=source, strategy=strategy, signal_id=signal_id,
@@ -349,6 +366,7 @@ class Ledger:
                 raise ValueError('Unknown pending order.')
             if order['side'] == 'buy':
                 state['cash'] += order['reserved']
+                state.get('exit_wanted', {}).pop(order['symbol'], None)
             else:
                 fails = state.setdefault('exit_fails', {}).get(order['symbol'], 0)+1
                 state['exit_fails'][order['symbol']] = fails
@@ -367,6 +385,7 @@ class Ledger:
             state['cash'] += order['reserved']
             symbol = order['symbol']
             if not (finite(qty) and finite(quote_spent) and qty > 0 and quote_spent > 0):
+                state.get('exit_wanted', {}).pop(symbol, None)
                 self.event(state, now, kind='live_released', client_order_id=cid, symbol=symbol,
                            side='buy', reason='nothing filled')
                 return dict(filled=False)
@@ -403,6 +422,7 @@ class Ledger:
                 pnl=proceeds-cost_part, reason=order['reason'], client_order_id=cid, mode='live')
             if closing:
                 del state['positions'][symbol]
+                state.get('exit_wanted', {}).pop(symbol, None)
             else:
                 position['qty'], position['cost'] = remaining, position['cost']-cost_part
                 self._begin_exit(state, symbol, quote_received/qty, now, order['reason'])
@@ -413,6 +433,7 @@ class Ledger:
     def live_write_off_dust(self, symbol, now):
         def operation(state):
             position = state['positions'].pop(symbol, None)
+            state.get('exit_wanted', {}).pop(symbol, None)
             if position is None:
                 return False
             self.event(state, now, kind='dust_written_off', symbol=symbol, qty=position['qty'],

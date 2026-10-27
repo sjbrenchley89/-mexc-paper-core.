@@ -819,6 +819,111 @@ class ThirdReviewTests(Base):
         second.release()
 
 
+class FourthReviewTests(Base):
+    def sell_signal(self, identifier='exit1'):
+        return self.ledger.signal(identifier, 'BTCUSDT', 'sell', 100.0, 1.0, 'tradingview', 'technical',
+                                  self.now, self.now, LIQUIDITY)
+
+    def test_rejected_signal_exit_is_retried_after_the_cooldown(self):
+        self.buy()
+        self.tick()
+        self.client.on_new = 'reject'
+        self.sell_signal()
+        self.tick()
+        self.assertIn('BTCUSDT', self.state()['positions'])
+        self.client.on_new = None
+        for _ in range(12):
+            self.tick(10)
+        self.assertEqual(self.state()['positions'], {})
+        self.assertEqual([s['side'] for s in self.client.sent], ['BUY', 'SELL', 'SELL'])
+
+    def test_retries_still_respect_the_cooldown(self):
+        self.buy()
+        self.tick()
+        self.client.on_new = 'reject'
+        self.sell_signal()
+        self.tick()
+        sent = len(self.client.sent)
+        self.tick(5)
+        self.assertEqual(len(self.client.sent), sent)
+
+    def test_one_symbols_data_failure_does_not_block_other_orders(self):
+        class Ledger:
+            def live_outbox(self, now):
+                return {'a': dict(created=1, submitted=None, symbol='AUSDT', side='sell'),
+                        'b': dict(created=2, submitted=None, symbol='BUSDT', side='sell')}
+            def live_acquire(self, *args):
+                pass
+        executor = live.Executor(Ledger(), None, {'symbols': []}, None, log=self.logs.append)
+        seen = []
+        def submit(cid, order, now):
+            if cid == 'a':
+                raise RuntimeError('ticker down')
+            seen.append(cid)
+            return False
+        executor._submit = submit
+        executor.run_outbox(5)
+        self.assertEqual(seen, ['b'])
+        self.assertEqual(self.logs[-1]['type'], 'RuntimeError')
+
+    def test_rate_limit_still_stops_the_whole_outbox(self):
+        class Ledger:
+            def live_outbox(self, now):
+                return {'a': dict(created=1, submitted=None, symbol='AUSDT', side='sell')}
+        executor = live.Executor(Ledger(), None, {'symbols': []}, None, log=self.logs.append)
+        def submit(cid, order, now):
+            raise exchange.RateLimited(60)
+        executor._submit = submit
+        with self.assertRaises(exchange.RateLimited):
+            executor.run_outbox(5)
+
+    def test_sell_signal_during_unreconciled_buy_is_applied_after_it_settles(self):
+        self.buy()
+        original = self.client.query_order
+        self.client.query_order = lambda s, c: (_ for _ in ()).throw(exchange.Uncertain('down'))
+        self.tick()
+        result = self.sell_signal()
+        self.assertEqual((result['accepted'], result.get('deferred')), (True, True))
+        self.client.query_order = original
+        for _ in range(4):
+            self.tick()
+        self.assertEqual(self.state()['positions'], {})
+        self.assertEqual([s['side'] for s in self.client.sent], ['BUY', 'SELL'])
+        self.assertAlmostEqual(self.client.balances.get('BTC', 0), 0, places=6)
+
+    def test_sell_signal_before_a_buy_is_sent_cancels_the_buy(self):
+        self.buy()
+        result = self.sell_signal()
+        self.assertEqual((result['accepted'], result['cancelled_pending_buy']), (True, True))
+        self.tick()
+        self.assertEqual(self.client.sent, [])
+        state = self.state()
+        self.assertEqual((state['cash'], state['pending']), (50.0, {}))
+
+    def test_a_stale_exit_wish_does_not_sell_the_next_purchase(self):
+        self.buy('first')
+        self.tick()
+        self.sell_signal()
+        self.tick()
+        self.tick()
+        self.assertEqual(self.state()['positions'], {})
+        self.buy('second')
+        self.tick()
+        self.tick()
+        self.assertIn('BTCUSDT', self.state()['positions'])
+        self.assertEqual([s['side'] for s in self.client.sent], ['BUY', 'SELL', 'BUY'])
+
+    def test_a_buy_that_fills_nothing_leaves_no_exit_wish_behind(self):
+        self.buy('first')
+        self.client.query_order = lambda s, c: (_ for _ in ()).throw(exchange.Uncertain('down'))
+        self.tick()
+        self.sell_signal()
+        self.assertIn('BTCUSDT', self.state().get('exit_wanted', {}))
+        cid = next(iter(self.state()['pending']))
+        self.ledger.live_release(cid, 'test', self.now)
+        self.assertNotIn('BTCUSDT', self.state().get('exit_wanted', {}))
+
+
 if __name__ == '__main__':
     unittest.main()
 

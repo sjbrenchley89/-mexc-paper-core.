@@ -231,11 +231,16 @@ class Executor:
 
     def run_outbox(self, now):
         for cid, order in sorted(self.ledger.live_outbox(now).items(), key=lambda item: item[1]['created']):
-            if order['submitted'] is None:
-                if not self._submit(cid, order, now):
-                    continue
-                order = self.ledger.live_outbox(now)[cid]
-            self._resolve(cid, order, now)
+            try:
+                if order['submitted'] is None:
+                    if not self._submit(cid, order, now):
+                        continue
+                    order = self.ledger.live_outbox(now)[cid]
+                self._resolve(cid, order, now)
+            except exchange.RateLimited:
+                raise
+            except Exception as exc:
+                self.log({'live': 'order_error', 'symbol': order['symbol'], 'type': type(exc).__name__})
 
     def _submit(self, cid, order, now):
         symbol = order['symbol']
