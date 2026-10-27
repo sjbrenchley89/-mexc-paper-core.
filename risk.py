@@ -159,6 +159,14 @@ class Ledger:
         return dict(news_veto_enabled=bool(self.config.get('news')),
                     active_blocks=[b for b in blocks if b['until'] > now])
 
+    def _note_exit_failure(self, state, symbol, now):
+        fails = state.setdefault('exit_fails', {}).get(symbol, 0)+1
+        state['exit_fails'][symbol] = fails
+        state.setdefault('exit_wait', {})[symbol] = now+min(600, 15*2**fails)
+        if fails == 5:
+            state.update(paused=True, review_required=True)
+            self.event(state, now, kind='live_halt', reason=f'{symbol} exit failed {fails} times')
+
     def _begin_exit(self, state, symbol, price, now, reason):
         pending = state.setdefault('pending', {})
         state.setdefault('exit_wanted', {}).setdefault(symbol, reason)
@@ -368,18 +376,14 @@ class Ledger:
                 state['cash'] += order['reserved']
                 state.get('exit_wanted', {}).pop(order['symbol'], None)
             else:
-                fails = state.setdefault('exit_fails', {}).get(order['symbol'], 0)+1
-                state['exit_fails'][order['symbol']] = fails
-                state.setdefault('exit_wait', {})[order['symbol']] = now+min(600, 15*2**fails)
-                if fails == 5:
-                    state.update(paused=True, review_required=True)
-                    self.event(state, now, kind='live_halt', reason=f"{order['symbol']} exit failed {fails} times")
+                self._note_exit_failure(state, order['symbol'], now)
             self.event(state, now, kind='live_released', client_order_id=cid, symbol=order['symbol'],
                        side=order['side'], reason=reason[:200])
             self.limits(state, now)
         return self.transact(now, operation)
 
-    def live_settle_buy(self, cid, qty, quote_spent, fee_value, fee_cash, now, executed_at=None):
+    def live_settle_buy(self, cid, qty, quote_spent, fee_value, fee_cash, now, executed_at=None,
+                        base_fee_value=0.0, exec_price=None):
         def operation(state):
             order = self._pending(state, cid, 'buy')
             state['cash'] += order['reserved']
@@ -394,7 +398,7 @@ class Ledger:
                 stop=order['stop'], take_profit=order['take_profit'], source=order['source'],
                 strategy=order['strategy'])
             self.event(state, self._fill_time(order, executed_at, now), kind='fill', action='buy', id=order['signal_id'], symbol=symbol,
-                price=quote_spent/qty, qty=qty, fee=fee_value, source=order['source'],
+                price=exec_price or quote_spent/qty, qty=qty, fee=fee_value+base_fee_value, source=order['source'],
                 strategy=order['strategy'], latency=order['latency'], client_order_id=cid, mode='live')
             self.limits(state, now)
             return dict(filled=True, qty=qty)
@@ -406,6 +410,8 @@ class Ledger:
             symbol = order['symbol']
             position = state['positions'].get(symbol)
             if position is None or not (finite(qty) and finite(quote_received) and qty > 0 and quote_received > 0):
+                if position is not None:
+                    self._note_exit_failure(state, symbol, now)
                 self.event(state, now, kind='live_released', client_order_id=cid, symbol=symbol,
                            side='sell', reason='nothing sold')
                 return dict(filled=False)

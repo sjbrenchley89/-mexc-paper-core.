@@ -139,6 +139,20 @@ class CommandTests(unittest.TestCase):
             self.assertIn('API keys present in environment', failed)
             self.assertIn('Paper trial length', failed)
 
+    def test_doctor_reports_progress_without_network_or_trading(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict('os.environ', {}, clear=True):
+            code, out = self.run_cli('--state', str(Path(directory)/'paper.sqlite'), 'doctor')
+            data = json.loads(out)
+            self.assertEqual(code, 0)
+            self.assertFalse(data['ready_for_preflight'])
+            self.assertIn('makes no contact with MEXC', data['note'])
+            self.assertTrue(any(s['name'] == 'MEXC_API_KEY and MEXC_API_SECRET set' and not s['ok'] for s in data['steps']))
+
+    def test_doctor_is_refused_with_the_live_flag(self):
+        with tempfile.TemporaryDirectory() as directory:
+            code, _ = self.run_cli('--live', '--state', str(Path(directory)/'live.sqlite'), 'doctor')
+            self.assertEqual(code, 1)
+
     def test_live_start_refuses_when_preflight_fails(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict('os.environ', {'WEBHOOK_SECRET': 'x'*40}, clear=True):
             code, out = self.run_cli('--state', str(Path(directory)/'paper.sqlite'), 'live-start')

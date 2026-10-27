@@ -6,6 +6,7 @@ import json
 import math
 import os
 import secrets
+import sys
 import tempfile
 import threading
 import time
@@ -317,7 +318,7 @@ def main():
     parser.add_argument('--live', action='store_true', help='use the live ledger for status and safety controls')
     sub = parser.add_subparsers(dest='command', required=True)
     for name in ('init','status','pause','resume','kill','demo','setup','scan','news-list','copy-status','copy-report',
-                 'live-preflight'):
+                 'live-preflight', 'doctor'):
         sub.add_parser(name)
     block = sub.add_parser('news-block')
     block.add_argument('--symbol', required=True, help='an allowed symbol such as BTCUSDT, or * for all')
@@ -393,6 +394,15 @@ def main():
         elif args.command == 'start':
             serve(ledger, config, args.port)
             return
+        elif args.command == 'doctor':
+            try:
+                load_secrets()
+                has_secret = True
+            except ValueError:
+                has_secret = False
+            keys = bool(os.environ.get('MEXC_API_KEY')) and bool(os.environ.get('MEXC_API_SECRET'))
+            paper_state = Ledger(args.paper_state, config).status(time.time())
+            result = live.doctor(config, paper_state, time.time(), has_secret, keys, sys.version_info[:2])
         elif args.command == 'live-preflight':
             _, checks, ready = live_checks(config, args, time.time())
             result = dict(ready=ready, checks=checks, nothing_was_traded=True)

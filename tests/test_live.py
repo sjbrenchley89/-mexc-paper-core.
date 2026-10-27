@@ -5,6 +5,7 @@ import tempfile
 import unittest
 import urllib.error
 from pathlib import Path
+from unittest.mock import patch
 
 import bot
 import exchange
@@ -922,6 +923,122 @@ class FourthReviewTests(Base):
         cid = next(iter(self.state()['pending']))
         self.ledger.live_release(cid, 'test', self.now)
         self.assertNotIn('BTCUSDT', self.state().get('exit_wanted', {}))
+
+
+class FifthReviewTests(Base):
+    def test_holding_period_uses_the_calendar_anniversary(self):
+        import records
+        from datetime import datetime, timezone
+        def ts(text):
+            return datetime.fromisoformat(text).replace(tzinfo=timezone.utc).timestamp()
+        held = records.held_over_twelve_months
+        self.assertTrue(held(ts('2023-01-01T01:00:00'), ts('2024-01-02T01:00:00')))
+        self.assertFalse(held(ts('2023-01-01T01:00:00'), ts('2024-01-01T01:00:00')))
+        self.assertFalse(held(ts('2023-01-01T01:00:00'), ts('2023-06-01T01:00:00')))
+        self.assertFalse(held(ts('2024-02-29T01:00:00'), ts('2025-03-01T01:00:00')))
+        self.assertTrue(held(ts('2024-02-29T01:00:00'), ts('2025-03-02T01:00:00')))
+
+    def test_export_flags_a_twelve_month_hold(self):
+        import csv
+        import records
+        from datetime import datetime, timezone
+        def ts(text):
+            return datetime.fromisoformat(text).replace(tzinfo=timezone.utc).timestamp()
+        state = dict(mode='paper', events=[
+            dict(timestamp=ts('2023-01-01T01:00:00'), kind='fill', action='buy', symbol='BTCUSDT', qty=1, price=100,
+                 fee=.1, strategy='t', source='demo'),
+            dict(timestamp=ts('2024-01-02T01:00:00'), kind='fill', action='sell', symbol='BTCUSDT', qty=1, price=110,
+                 fee=.1, pnl=9.8, reason='signal', strategy='t', source='demo')])
+        output = self.dir/'r.csv'
+        records.export(state, output, flat_rate=1.5)
+        with open(output, newline='') as file:
+            sell = [r for r in csv.DictReader(file) if r['type'] == 'sell'][0]
+        self.assertEqual(sell['held_over_12_months'], 'yes')
+
+    def zero_fill_sells(self):
+        def refuse(symbol, side, order_type, cid, quantity=None, quote_order_qty=None):
+            self.client.sent.append(dict(symbol=symbol, side=side, type=order_type, cid=cid, quantity=quantity,
+                                         quote=quote_order_qty))
+            self.client.orders[cid] = dict(orderId='z'+cid[:6], status='CANCELED', executedQty='0',
+                                           cumulativeQuoteQty='0')
+            return {}
+        self.client.new_order = refuse
+
+    def test_zero_fill_cancellations_back_off_instead_of_hammering(self):
+        self.buy()
+        self.tick()
+        self.zero_fill_sells()
+        self.ledger.signal('x1', 'BTCUSDT', 'sell', 100.0, 1.0, 'tradingview', 'technical', self.now, self.now, LIQUIDITY)
+        for _ in range(6):
+            self.tick()
+        sells = [s for s in self.client.sent if s['side'] == 'SELL']
+        self.assertLessEqual(len(sells), 2)
+        self.assertGreaterEqual(self.state()['exit_fails']['BTCUSDT'], 1)
+
+    def test_repeated_zero_fill_cancellations_halt_for_review(self):
+        self.buy()
+        self.tick()
+        self.zero_fill_sells()
+        self.ledger.signal('x1', 'BTCUSDT', 'sell', 100.0, 1.0, 'tradingview', 'technical', self.now, self.now, LIQUIDITY)
+        for _ in range(12):
+            self.now += 700
+            self.executor.cycle(self.now)
+        self.assertTrue(self.state()['review_required'])
+        self.assertIn('BTCUSDT', self.state()['positions'])
+
+    def test_base_coin_commission_is_visible_without_double_counting(self):
+        self.client.fee_asset = 'BTC'
+        self.client.fee_rate = .0005
+        self.buy()
+        self.tick()
+        state = self.state()
+        fill = [e for e in state['events'] if e['kind'] == 'fill' and e['action'] == 'buy'][0]
+        quote = self.client.sent[0]['quote']
+        self.assertAlmostEqual(fill['price'], 100.0, places=6)
+        self.assertAlmostEqual(fill['fee'], fill['qty']*100.0*.0005/(1-.0005), places=6)
+        self.assertAlmostEqual(state['positions']['BTCUSDT']['cost'], quote, places=6)
+        self.assertAlmostEqual(fill['qty']*fill['price']+fill['fee'], quote, places=4)
+
+
+class DoctorTests(unittest.TestCase):
+    def trial(self, days=40, trades=60, pnl=1.0, halted=False):
+        events = [dict(timestamp=NOW-days*86400, kind='fill', action='buy', symbol='BTCUSDT')]
+        events += [dict(timestamp=NOW-86400, kind='fill', action='sell', symbol='BTCUSDT', pnl=pnl/trades)
+                   for _ in range(trades)]
+        return dict(events=events, review_required=halted)
+
+    def config(self, eligible=True, key=True):
+        config = copy.deepcopy(CONFIG)
+        config['live'] = dict(mexc_eligibility_confirmed=eligible, trade_only_key_confirmed=key)
+        return config
+
+    def test_fresh_install_lists_what_is_missing_in_order(self):
+        report = live.doctor(self.config(False, False), self.trial(days=0, trades=0, pnl=0), NOW, False, False, (3, 13))
+        names = [s['name'] for s in report['steps'] if not s['ok']]
+        self.assertIn('Webhook secret created', names)
+        self.assertIn('Paper trading for 30 days', names)
+        self.assertFalse(report['ready_for_preflight'])
+        self.assertEqual(report['next_step'], 'Type: python bot.py setup')
+
+    def test_everything_done_points_to_the_preflight(self):
+        report = live.doctor(self.config(), self.trial(), NOW, True, True, (3, 13))
+        self.assertTrue(report['ready_for_preflight'])
+        self.assertEqual(report['next_step'], 'Type: python bot.py live-preflight')
+
+    def test_each_missing_item_blocks_readiness(self):
+        cases = [dict(trial=self.trial(days=5)), dict(trial=self.trial(trades=3)), dict(trial=self.trial(pnl=-1)),
+                 dict(trial=self.trial(halted=True)), dict(config=self.config(eligible=False)),
+                 dict(config=self.config(key=False)), dict(secret=False), dict(keys=False), dict(python=(3, 9))]
+        for case in cases:
+            report = live.doctor(case.get('config', self.config()), case.get('trial', self.trial()), NOW,
+                                 case.get('secret', True), case.get('keys', True), case.get('python', (3, 13)))
+            self.assertFalse(report['ready_for_preflight'], case)
+
+    def test_report_contains_no_secret_values(self):
+        with patch.dict('os.environ', {'MEXC_API_KEY': 'KEYVALUE123', 'MEXC_API_SECRET': 'SECRETVALUE456'}):
+            text = json.dumps(live.doctor(self.config(), self.trial(), NOW, True, True, (3, 13)))
+        self.assertNotIn('KEYVALUE123', text)
+        self.assertNotIn('SECRETVALUE456', text)
 
 
 if __name__ == '__main__':
