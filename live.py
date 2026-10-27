@@ -142,6 +142,7 @@ class Executor:
             return 'rate_limited'
         try:
             self.sync(now)
+            self.mark_positions(now)
             self.run_outbox(now)
         except exchange.RateLimited as exc:
             self.blocked_until = now+exc.retry_after
@@ -151,6 +152,15 @@ class Executor:
             self.log({'live': 'exchange_error', 'type': type(exc).__name__, 'detail': str(exc)[:200]})
             return 'error'
         return 'ok'
+
+    def mark_positions(self, now):
+        symbols = list(self.ledger.status(now)['positions'])
+        try:
+            quotes = {symbol: self.market.price(symbol) for symbol in symbols}
+        except Exception:
+            return
+        if quotes:
+            self.ledger.mark(quotes, now)
 
     def sync(self, now):
         account = self.client.account()
@@ -170,11 +180,11 @@ class Executor:
             except Exception:
                 price = None
             if price is None:
-                if idle and symbol is None:
+                if symbol is None:
                     problems.append(f'unvalued holding {asset}')
                 continue
             value += amount*price
-            if idle and symbol is None and amount*price >= DUST_VALUE:
+            if symbol is None and amount*price >= DUST_VALUE:
                 problems.append(f'unrecognised holding {asset}')
             if idle and symbol is not None:
                 expected = state['positions'].get(symbol, {}).get('qty', 0.0)
@@ -185,7 +195,7 @@ class Executor:
         for symbol, position in state['positions'].items():
             if idle and symbol[:-len(QUOTE)] not in held:
                 problems.append(f'{symbol[:-len(QUOTE)]} position missing from the account')
-        if idle and value > TOTAL_CAP+ACCOUNT_TOLERANCE:
+        if value > TOTAL_CAP+ACCOUNT_TOLERANCE:
             problems.append('account value exceeds the $50 budget')
         if problems and not state['review_required']:
             self.log({'live': 'halt', 'reasons': problems})
@@ -286,9 +296,10 @@ class Executor:
             trades = []
         if not isinstance(trades, list) or not trades:
             estimate = quote_amount*float(self.config['fee'])
-            return dict(value=estimate, cash=estimate, base=0.0, estimated=True)
+            return dict(value=estimate, cash=estimate, base=0.0, estimated=True, time=None)
         value = cash = base_fee = 0.0
         estimated = False
+        times = [number(t.get('time'))/1000 for t in trades if number(t.get('time')) > 0]
         for trade in trades:
             amount, asset = number(trade.get('commission')), trade.get('commissionAsset')
             if asset == QUOTE:
@@ -299,15 +310,17 @@ class Executor:
             else:
                 value += number(trade.get('quoteQty'))*float(self.config['fee'])
                 estimated = True
-        return dict(value=value, cash=cash, base=base_fee, estimated=estimated)
+        return dict(value=value, cash=cash, base=base_fee, estimated=estimated, time=max(times) if times else None)
 
     def _settle(self, cid, order, found, now):
         executed = number(found.get('executedQty'))
         quote_amount = number(found.get('cumulativeQuoteQty', found.get('cummulativeQuoteQty')))
         fees = self._fees(order, found, now)
+        stamp = number(found.get('updateTime') or found.get('time'))/1000 or None
+        when = fees['time'] or stamp
         if order['side'] == 'buy':
-            result = self.ledger.live_settle_buy(cid, executed-fees['base'], quote_amount, fees['value'], fees['cash'], now)
+            result = self.ledger.live_settle_buy(cid, executed-fees['base'], quote_amount, fees['value'], fees['cash'], now, when)
         else:
-            result = self.ledger.live_settle_sell(cid, executed, quote_amount, fees['value'], fees['cash'], now)
+            result = self.ledger.live_settle_sell(cid, executed, quote_amount, fees['value'], fees['cash'], now, when)
         self.log({'live': 'settled', 'symbol': order['symbol'], 'side': order['side'], 'filled': result['filled'],
                   'fee_estimated': fees['estimated']})

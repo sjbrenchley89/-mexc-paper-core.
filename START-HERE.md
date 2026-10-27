@@ -204,7 +204,7 @@ This guide contains no programming code. Commands in ordinary text are things to
 
     Goal: know where to look without changing program internals. bot.py is the launcher and webhook receiver. risk.py owns the ledger, sizing, caps, pauses, exits, order intents and the news veto. exchange.py is the signed MEXC client. live.py turns order intents into real orders, settles them from MEXC's own records, and runs the go-live checks. copytrade.py holds the disconnected copy slot and its report. records.py writes the Australian-dollar CSV. market.py reads only official public MEXC spot data. strategies.py contains the two defined indicator rules. config.json contains ordinary settings. paper.sqlite saves simulated balances, unique alert IDs, review notes, and events. .env stores the private webhook token locally; it is never uploaded to GitHub. examples contains supplied alert files. tests contains the local safety checks. docs contains the staged implementation scope.
 
-    Type python -m unittest discover -s tests -v to run the local checks. Expected result: 128 tests pass. These checks, a local HTTP authentication check, and synthetic backtest runs passed in the task environment. Current MEXC connectivity, TradingView compilation and delivery, provider terms, and profitability were not verified.
+    Type python -m unittest discover -s tests -v to run the local checks. Expected result: 138 tests pass. These checks, a local HTTP authentication check, and synthetic backtest runs passed in the task environment. Current MEXC connectivity, TradingView compilation and delivery, provider terms, and profitability were not verified.
 
 19. **Use the news veto, copy slot, and AUD records — safe now.**
 

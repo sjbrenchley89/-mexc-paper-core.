@@ -45,6 +45,7 @@ class FakeClient:
         self.ip = '1.2.3.4'
         self.can_trade = True
         self.skew = 0
+        self.now_ms = None
 
     def server_time(self):
         return int((NOW+self.skew)*1000)
@@ -94,6 +95,9 @@ class FakeClient:
         oid = f'order{len(self.orders)+1}'
         self.orders[cid] = dict(orderId=oid, status='FILLED', executedQty=str(qty), cumulativeQuoteQty=str(quote))
         self.trades[oid] = [dict(commission=str(commission), commissionAsset=self.fee_asset, quoteQty=str(quote))]
+        if self.now_ms:
+            self.orders[cid].update(time=self.now_ms, updateTime=self.now_ms)
+            self.trades[oid][0]['time'] = self.now_ms
         if behaviour_is(self.on_new, 'executed_then_timeout'):
             raise exchange.Uncertain('timeout after send')
         return dict(orderId=oid)
@@ -653,6 +657,84 @@ class PartialSaleRecordTests(Base):
         self.assertAlmostEqual(sum(float(r['cost_base_usdt']) for r in sells), cost, places=6)
         self.assertAlmostEqual(float(sells[0]['cost_base_usdt'])/cost, 0.4, places=6)
         self.assertAlmostEqual(float(sells[1]['cost_base_aud']), float(sells[1]['cost_base_usdt'])*1.5)
+
+
+class SecondReviewTests(Base):
+    def fill_times(self, action):
+        return [e['timestamp'] for e in self.state()['events'] if e['kind'] == 'fill' and e['action'] == action]
+
+    def test_fill_is_stamped_with_the_exchange_execution_time(self):
+        self.buy()
+        executed = self.now+5
+        self.client.now_ms = int(executed*1000)
+        original = self.client.query_order
+        self.client.query_order = lambda s, c: (_ for _ in ()).throw(exchange.Uncertain('down'))
+        self.tick()
+        self.client.query_order = original
+        self.tick(100)
+        self.assertEqual(self.fill_times('buy'), [executed])
+
+    def test_implausible_exchange_time_falls_back_to_now(self):
+        self.buy()
+        self.client.now_ms = int((self.now+99999)*1000)
+        self.tick()
+        self.assertEqual(self.fill_times('buy'), [self.now])
+
+    def test_export_uses_execution_time_for_the_tax_year(self):
+        import csv
+        import records
+        self.buy()
+        executed = self.now+5
+        self.client.now_ms = int(executed*1000)
+        original = self.client.query_order
+        self.client.query_order = lambda s, c: (_ for _ in ()).throw(exchange.Uncertain('down'))
+        self.tick()
+        self.client.query_order = original
+        self.tick(100)
+        output = self.dir/'r.csv'
+        records.export(self.state(), output)
+        with open(output, newline='') as file:
+            row = next(csv.DictReader(file))
+        from datetime import datetime, timezone
+        self.assertEqual(row['date_utc'], datetime.fromtimestamp(executed, timezone.utc).isoformat(timespec='seconds'))
+
+    def test_oversized_account_cancels_a_queued_buy(self):
+        self.buy()
+        self.client.balances['USDT'] = 500
+        self.tick()
+        self.assertEqual(self.client.sent, [])
+        self.assertTrue(self.state()['review_required'])
+
+    def test_foreign_deposit_while_an_order_is_pending_halts(self):
+        self.buy()
+        self.client.balances['ETH'] = 2.0
+        self.tick()
+        self.assertEqual(self.client.sent, [])
+        self.assertTrue(self.state()['review_required'])
+
+    def test_kill_sells_within_one_executor_cycle_without_a_monitor_pass(self):
+        self.buy()
+        self.tick()
+        sent = len(self.client.sent)
+        self.ledger.control('kill', self.now+1)
+        self.tick()
+        self.assertEqual([s['side'] for s in self.client.sent[sent:]], ['SELL'])
+        self.assertEqual(self.state()['positions'], {})
+
+    def test_stop_loss_triggers_from_the_executor_cycle_alone(self):
+        self.buy()
+        self.tick()
+        self.market.last = 97.0
+        self.tick()
+        self.assertEqual(self.client.sent[-1]['side'], 'SELL')
+
+    def test_price_outage_does_not_break_the_cycle(self):
+        self.buy()
+        self.tick()
+        original = self.market.price
+        self.market.price = lambda symbol: (_ for _ in ()).throw(RuntimeError('network'))
+        self.assertEqual(self.tick(), 'ok')
+        self.market.price = original
 
 
 if __name__ == '__main__':

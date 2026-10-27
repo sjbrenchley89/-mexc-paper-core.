@@ -167,6 +167,19 @@ class CopyTests(Base):
         result = self.ledger.signal('d', 'BTCUSDT', 'buy', 100, 1, 'copy', 'copy:fomo', NOW)
         self.assertEqual(result['reason'], 'copy_requires_source_time')
 
+    def test_stale_copy_sell_cannot_close_a_position(self):
+        self.assertTrue(self.process(self.event('buy1'))['accepted'])
+        result = self.process(self.event('sell1', action='sell', age=3600), NOW+1)
+        self.assertEqual(result['reason'], 'stale_or_future_signal')
+        self.assertIn('BTCUSDT', self.ledger.status(NOW+2)['positions'])
+        fresh = self.process(self.event('sell2', action='sell', age=5), NOW+2)
+        self.assertTrue(fresh['accepted'])
+
+    def test_copy_sell_needs_a_source_time(self):
+        self.process(self.event('buy1'))
+        result = self.ledger.signal('s', 'BTCUSDT', 'sell', 100, 1, 'copy', 'copy:fomo', NOW+1)
+        self.assertEqual(result['reason'], 'copy_requires_source_time')
+
     def test_report_counts_latency_pnl_and_rejections(self):
         self.process(self.event('b', age=500))
         self.process(self.event('a', age=20))

@@ -225,6 +225,11 @@ class Ledger:
                 return reject('simulated_source_not_allowed_live')
             if not finite(price) or price <= 0 or not finite(atr) or atr <= 0:
                 return reject('invalid_price_or_atr')
+            if source == 'copy':
+                if source_time is None:
+                    return reject('copy_requires_source_time')
+                if not finite(source_time) or not 0 <= now-source_time <= 120:
+                    return reject('stale_or_future_signal')
             state['prices'][symbol] = price
             equity = self.limits(state, now)
             if action == 'sell':
@@ -245,8 +250,6 @@ class Ledger:
                 return reject('max_positions')
             if self.live and not state.get('synced'):
                 return reject('not_synced_with_exchange')
-            if source == 'copy' and source_time is None:
-                return reject('copy_requires_source_time')
             if source_time is not None and (not finite(source_time) or not 0 <= now-source_time <= 120):
                 return reject('stale_or_future_signal')
             if source not in ('demo', 'backtest'):
@@ -318,6 +321,12 @@ class Ledger:
     def live_outbox(self, now):
         return self.transact(now, lambda state: copy.deepcopy(state.get('pending', {})))
 
+    @staticmethod
+    def _fill_time(order, executed_at, now):
+        if finite(executed_at) and (order.get('submitted') or 0)-60 <= executed_at <= now+60:
+            return executed_at
+        return now
+
     def _pending(self, state, cid, side):
         order = state.get('pending', {}).get(cid)
         if order is None or order['side'] != side:
@@ -352,7 +361,7 @@ class Ledger:
             self.limits(state, now)
         return self.transact(now, operation)
 
-    def live_settle_buy(self, cid, qty, quote_spent, fee_value, fee_cash, now):
+    def live_settle_buy(self, cid, qty, quote_spent, fee_value, fee_cash, now, executed_at=None):
         def operation(state):
             order = self._pending(state, cid, 'buy')
             state['cash'] += order['reserved']
@@ -365,14 +374,14 @@ class Ledger:
             state['positions'][symbol] = dict(qty=qty, entry_price=quote_spent/qty, cost=quote_spent+fee_value,
                 stop=order['stop'], take_profit=order['take_profit'], source=order['source'],
                 strategy=order['strategy'])
-            self.event(state, now, kind='fill', action='buy', id=order['signal_id'], symbol=symbol,
+            self.event(state, self._fill_time(order, executed_at, now), kind='fill', action='buy', id=order['signal_id'], symbol=symbol,
                 price=quote_spent/qty, qty=qty, fee=fee_value, source=order['source'],
                 strategy=order['strategy'], latency=order['latency'], client_order_id=cid, mode='live')
             self.limits(state, now)
             return dict(filled=True, qty=qty)
         return self.transact(now, operation)
 
-    def live_settle_sell(self, cid, qty, quote_received, fee_value, fee_cash, now):
+    def live_settle_sell(self, cid, qty, quote_received, fee_value, fee_cash, now, executed_at=None):
         def operation(state):
             order = self._pending(state, cid, 'sell')
             symbol = order['symbol']
@@ -389,8 +398,8 @@ class Ledger:
             state['cash'] += quote_received-fee_cash
             state.get('exit_fails', {}).pop(symbol, None)
             state.get('exit_wait', {}).pop(symbol, None)
-            self.event(state, now, kind='fill', action='sell', symbol=symbol, strategy=position['strategy'],
-                source=position['source'], qty=qty, price=quote_received/qty, fee=fee_value,
+            self.event(state, self._fill_time(order, executed_at, now), kind='fill', action='sell', symbol=symbol,
+                strategy=position['strategy'], source=position['source'], qty=qty, price=quote_received/qty, fee=fee_value,
                 pnl=proceeds-cost_part, reason=order['reason'], client_order_id=cid, mode='live')
             if closing:
                 del state['positions'][symbol]
