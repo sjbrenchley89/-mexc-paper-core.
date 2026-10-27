@@ -46,6 +46,7 @@ class FakeClient:
         self.can_trade = True
         self.skew = 0
         self.now_ms = None
+        self.partial_sell = None
 
     def server_time(self):
         return int((NOW+self.skew)*1000)
@@ -76,7 +77,8 @@ class FakeClient:
         if side == 'BUY':
             qty, quote = quote_order_qty/price, quote_order_qty
         else:
-            qty, quote = quantity, quantity*price
+            qty = quantity*(self.partial_sell or 1)
+            quote = qty*price
             if qty > self.balances.get('BTC', 0)+1e-12:
                 raise exchange.ExchangeError('Insufficient position', code=30004, status=400)
         commission = {'USDT': quote*self.fee_rate, 'BTC': qty*self.fee_rate, 'MX': 3.0}[self.fee_asset]
@@ -93,7 +95,8 @@ class FakeClient:
             if self.fee_asset == 'USDT':
                 self.balances['USDT'] -= commission
         oid = f'order{len(self.orders)+1}'
-        self.orders[cid] = dict(orderId=oid, status='FILLED', executedQty=str(qty), cumulativeQuoteQty=str(quote))
+        status = 'PARTIALLY_CANCELED' if side == 'SELL' and self.partial_sell else 'FILLED'
+        self.orders[cid] = dict(orderId=oid, status=status, executedQty=str(qty), cumulativeQuoteQty=str(quote))
         self.trades[oid] = [dict(commission=str(commission), commissionAsset=self.fee_asset, quoteQty=str(quote))]
         if self.now_ms:
             self.orders[cid].update(time=self.now_ms, updateTime=self.now_ms)
@@ -735,6 +738,85 @@ class SecondReviewTests(Base):
         self.market.price = lambda symbol: (_ for _ in ()).throw(RuntimeError('network'))
         self.assertEqual(self.tick(), 'ok')
         self.market.price = original
+
+
+class ThirdReviewTests(Base):
+    def test_signal_exit_partly_filled_keeps_selling_the_rest(self):
+        self.buy()
+        self.tick()
+        self.client.partial_sell = .5
+        self.ledger.signal('exit1', 'BTCUSDT', 'sell', 100.0, 1.0, 'tradingview', 'technical', self.now, self.now, LIQUIDITY)
+        self.tick()
+        state = self.state()
+        self.assertEqual([o['reason'] for o in state['pending'].values()], ['signal'])
+        self.assertAlmostEqual(state['positions']['BTCUSDT']['qty'], self.client.balances['BTC'])
+        self.client.partial_sell = None
+        self.tick()
+        self.tick()
+        self.assertEqual(self.state()['positions'], {})
+        self.assertAlmostEqual(self.client.balances.get('BTC', 0), 0, places=6)
+
+    def test_stop_exit_partly_filled_still_finishes_if_price_rebounds(self):
+        self.buy()
+        self.tick()
+        self.client.partial_sell = .5
+        self.market.last = 97.0
+        self.tick()
+        self.client.partial_sell = None
+        self.market.last = 100.0
+        self.tick()
+        self.tick()
+        self.assertEqual(self.state()['positions'], {})
+
+    def test_a_new_exit_never_reuses_a_client_order_id(self):
+        self.buy()
+        self.tick()
+        self.client.partial_sell = .5
+        self.market.last = 97.0
+        self.tick()
+        self.client.partial_sell = None
+        self.tick()
+        self.tick()
+        sells = [s['cid'] for s in self.client.sent if s['side'] == 'SELL']
+        self.assertEqual(len(sells), len(set(sells)))
+        self.assertGreaterEqual(len(sells), 2)
+
+    def test_one_failing_ticker_does_not_hide_another_positions_stop(self):
+        class Ledger:
+            marked = None
+            def status(self, now):
+                return {'positions': {'BTCUSDT': {}, 'ETHUSDT': {}}}
+            def mark(self, quotes, now):
+                self.marked = quotes
+        class Market:
+            def price(self, symbol):
+                if symbol == 'ETHUSDT':
+                    raise RuntimeError('ticker down')
+                return 90.0
+        ledger = Ledger()
+        live.Executor(ledger, None, {'symbols': ['BTCUSDT']}, Market(), log=lambda m: None).mark_positions(1)
+        self.assertEqual(ledger.marked, {'BTCUSDT': 90.0})
+
+    def test_market_quotes_skips_symbols_that_fail(self):
+        import market
+        from unittest.mock import patch
+        def price(symbol):
+            if symbol == 'ETHUSDT':
+                raise RuntimeError('down')
+            return 5.0
+        with patch('market.price', price):
+            self.assertEqual(market.quotes(['BTCUSDT', 'ETHUSDT']), {'BTCUSDT': 5.0})
+            self.assertEqual(market.quotes([]), {})
+
+    def test_process_lock_is_exclusive_until_released(self):
+        path = self.dir/'live.lock'
+        first, second = live.ProcessLock(path), live.ProcessLock(path)
+        first.acquire()
+        with self.assertRaisesRegex(ValueError, 'already running'):
+            second.acquire()
+        first.release()
+        second.acquire()
+        second.release()
 
 
 if __name__ == '__main__':

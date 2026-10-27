@@ -71,6 +71,16 @@ def trading_status(symbol):
     return dict(ok=True, status=str(info.get('status')))
 
 
+def quotes(symbols):
+    result = {}
+    for symbol in symbols:
+        try:
+            result[symbol] = price(symbol)
+        except Exception:
+            continue
+    return result
+
+
 def liquidity(symbol):
     book = get('/api/v3/depth', symbol=symbol, limit=100)
     bid, ask = float(book['bids'][0][0]), float(book['asks'][0][0])

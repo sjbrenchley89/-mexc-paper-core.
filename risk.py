@@ -165,7 +165,7 @@ class Ledger:
             return
         if now < state.get('exit_wait', {}).get(symbol, 0):
             return
-        cid = order_id('x', f'{symbol}:{int(now*1000)}')
+        cid = order_id('x', f'{symbol}:{int(now*1000)}:{len(state["events"])}')
         pending[cid] = dict(side='sell', symbol=symbol, qty=state['positions'][symbol]['qty'], reason=reason,
                             ref_price=price, created=now, submitted=None)
         self.event(state, now, kind='live_exit_intent', symbol=symbol, reason=reason, client_order_id=cid)
@@ -405,6 +405,7 @@ class Ledger:
                 del state['positions'][symbol]
             else:
                 position['qty'], position['cost'] = remaining, position['cost']-cost_part
+                self._begin_exit(state, symbol, quote_received/qty, now, order['reason'])
             self.limits(state, now)
             return dict(filled=True, qty=qty, closed=closing)
         return self.transact(now, operation)

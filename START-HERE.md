@@ -204,7 +204,7 @@ This guide contains no programming code. Commands in ordinary text are things to
 
     Goal: know where to look without changing program internals. bot.py is the launcher and webhook receiver. risk.py owns the ledger, sizing, caps, pauses, exits, order intents and the news veto. exchange.py is the signed MEXC client. live.py turns order intents into real orders, settles them from MEXC's own records, and runs the go-live checks. copytrade.py holds the disconnected copy slot and its report. records.py writes the Australian-dollar CSV. market.py reads only official public MEXC spot data. strategies.py contains the two defined indicator rules. config.json contains ordinary settings. paper.sqlite saves simulated balances, unique alert IDs, review notes, and events. .env stores the private webhook token locally; it is never uploaded to GitHub. examples contains supplied alert files. tests contains the local safety checks. docs contains the staged implementation scope.
 
-    Type python -m unittest discover -s tests -v to run the local checks. Expected result: 138 tests pass. These checks, a local HTTP authentication check, and synthetic backtest runs passed in the task environment. Current MEXC connectivity, TradingView compilation and delivery, provider terms, and profitability were not verified.
+    Type python -m unittest discover -s tests -v to run the local checks. Expected result: 144 tests pass. These checks, a local HTTP authentication check, and synthetic backtest runs passed in the task environment. Current MEXC connectivity, TradingView compilation and delivery, provider terms, and profitability were not verified.
 
 19. **Use the news veto, copy slot, and AUD records — safe now.**
 
@@ -234,7 +234,7 @@ This guide contains no programming code. Commands in ordinary text are things to
 
     What can still go wrong. This module was written from MEXC's published documentation and tested only against a simulated exchange. It has never been run against MEXC, so unexpected behavior is possible, and the first real orders are the first real test. Watch the first trades by hand and compare the bot's record with your MEXC order history. There are no stop orders at the exchange, so a stopped program, a lost internet connection or a fast price gap can lose more than planned. Fees paid in other coins are estimated. Treat the 50 USD as money you can lose entirely.
 
-    Safety against mix-ups. A ledger file remembers whether it is paper or live. The program refuses to open a live file in paper mode, or a paper file with --live, so a mistyped command cannot change your real records. The status page on port 8787 also says which mode is running.
+    Safety against mix-ups. Only one live program can run on a computer at a time: it holds an operating-system lock for as long as it is alive, and a second live-start refuses to run. If a sale only partly fills, the program keeps selling the rest. A ledger file remembers whether it is paper or live. The program refuses to open a live file in paper mode, or a paper file with --live, so a mistyped command cannot change your real records. The status page on port 8787 also says which mode is running.
 
     Records. python bot.py --live export-records --output live-records.csv --rates rates.csv writes the Australian record file from real fills, as in step 19.
 

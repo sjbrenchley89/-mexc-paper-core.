@@ -22,6 +22,33 @@ FORBIDDEN_PERMISSION_WORDS = ('WITHDRAW', 'TRANSFER', 'CONTRACT')
 PHRASE = 'I ACCEPT LIVE TRADING WITH REAL MONEY UP TO 50 USD'
 
 
+class ProcessLock:
+    """Held until the process ends; a stalled but alive process keeps it, so nothing can take over."""
+
+    def __init__(self, path):
+        self.path, self.handle = str(path), None
+
+    def acquire(self):
+        handle = open(self.path, 'a+b')
+        try:
+            if os.name == 'nt':
+                import msvcrt
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            handle.close()
+            raise ValueError('Another live process is already running on this computer.') from None
+        self.handle = handle
+
+    def release(self):
+        if self.handle:
+            self.handle.close()
+            self.handle = None
+
+
 def number(value):
     try:
         result = float(value)
@@ -154,11 +181,12 @@ class Executor:
         return 'ok'
 
     def mark_positions(self, now):
-        symbols = list(self.ledger.status(now)['positions'])
-        try:
-            quotes = {symbol: self.market.price(symbol) for symbol in symbols}
-        except Exception:
-            return
+        quotes = {}
+        for symbol in self.ledger.status(now)['positions']:
+            try:
+                quotes[symbol] = self.market.price(symbol)
+            except Exception:
+                continue
         if quotes:
             self.ledger.mark(quotes, now)
 

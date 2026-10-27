@@ -200,8 +200,9 @@ def serve(ledger, config, port, executor=None):
                     for symbol in auto_status_veto(ledger, config, market, time.time()):
                         print(json.dumps({'auto_veto': symbol, 'reason': 'exchange status not online'}), flush=True)
                 state = ledger.status(time.time())
-                quotes = {symbol:market.price(symbol) for symbol in state['positions']}
-                ledger.mark(quotes, time.time())
+                quotes = market.quotes(state['positions'])
+                if quotes:
+                    ledger.mark(quotes, time.time())
                 if config['option'] in ('B', 'C'):
                     for candidate in market.scan(config['symbols']):
                         if candidate['action'] == 'hold':
@@ -397,6 +398,8 @@ def main():
             result = dict(ready=ready, checks=checks, nothing_was_traded=True)
         elif args.command == 'live-start':
             load_secrets()
+            process_lock = live.ProcessLock(ROOT/'live.lock')
+            process_lock.acquire()
             now = time.time()
             client, checks, ready = live_checks(config, args, now)
             if not ready:
