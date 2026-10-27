@@ -27,6 +27,20 @@ def tax_year(timestamp):
     return f'{start}-{(start+1)%100:02d}'
 
 
+def aest_date(timestamp):
+    return (utc(timestamp)+timedelta(hours=10)).date()
+
+
+def held_over_twelve_months(bought, sold):
+    # Conservative: the CGT discount needs a full 12 months, so the anniversary day itself does not count.
+    start = aest_date(bought)
+    try:
+        anniversary = start.replace(year=start.year+1)
+    except ValueError:
+        anniversary = date(start.year+1, 3, 1)
+    return aest_date(sold) > anniversary
+
+
 def load_rates(path):
     rates = {}
     with open(path, newline='') as file:
@@ -88,7 +102,7 @@ def export(state, output, rates_path=None, flat_rate=None):
                 del open_buys[e['symbol']]
             row.update(reason=e['reason'], cost_base_usdt=cost_base, proceeds_usdt=proceeds,
                        gain_usdt=e['pnl'], days_held=round(days, 4),
-                       held_over_12_months='yes' if days > 366 else 'no',
+                       held_over_12_months='yes' if held_over_twelve_months(buy['time'], e['timestamp']) else 'no',
                        cost_base_aud=aud(cost_base, buy['rate']), proceeds_aud=aud(proceeds, rate))
             if rate is not None:
                 row['gain_aud'] = row['proceeds_aud']-row['cost_base_aud']

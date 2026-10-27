@@ -82,6 +82,33 @@ def paper_trial(state, now):
                 halted=bool(state['review_required']))
 
 
+def doctor(config, paper_state, now, has_secret, has_keys, python_version):
+    trial = paper_trial(paper_state, now)
+    confirmations = config.get('live', {})
+    steps = [
+        ('Python 3.12 or newer', python_version >= (3, 12), 'Install Python 3.12 or newer from python.org.'),
+        ('Webhook secret created', has_secret, 'Type: python bot.py setup'),
+        (f'Paper trading for {MIN_PAPER_DAYS} days', trial['days'] >= MIN_PAPER_DAYS,
+         f"{trial['days']:.1f} of {MIN_PAPER_DAYS} days so far. Keep python bot.py start running."),
+        (f'{MIN_PAPER_TRADES} closed paper trades', trial['closed_trades'] >= MIN_PAPER_TRADES,
+         f"{trial['closed_trades']} of {MIN_PAPER_TRADES} so far. Trades only happen when a signal arrives."),
+        ('Paper result positive after costs', trial['net_pnl'] > 0,
+         f"{trial['net_pnl']:.2f} USDT so far. If this stays negative, do not go live."),
+        ('No paper safety halt', not trial['halted'], 'Review and re-arm: python bot.py review-rearm --note "your reason"'),
+        ('MEXC eligibility confirmed in writing',
+         confirmations.get('mexc_eligibility_confirmed') is True,
+         'Ask MEXC support, then set live.mexc_eligibility_confirmed to true in config.json only if they said yes.'),
+        ('Trade-only MEXC key created', confirmations.get('trade_only_key_confirmed') is True,
+         'Follow step 15 of START-HERE.md, then set live.trade_only_key_confirmed to true.'),
+        ('MEXC_API_KEY and MEXC_API_SECRET set', has_keys, 'Set both environment variables as in step 15.'),
+    ]
+    rows = [dict(name=n, ok=bool(ok), action=None if ok else a) for n, ok, a in steps]
+    pending = [r for r in rows if not r['ok']]
+    return dict(steps=rows, ready_for_preflight=not pending,
+                next_step=pending[0]['action'] if pending else 'Type: python bot.py live-preflight',
+                note='This checks only your computer and settings. It makes no contact with MEXC and trades nothing.')
+
+
 def preflight(config, client, market, paper_state, now, env_has_keys):
     checks = []
     def add(name, ok, detail, warn=False):
@@ -352,7 +379,9 @@ class Executor:
         stamp = number(found.get('updateTime') or found.get('time'))/1000 or None
         when = fees['time'] or stamp
         if order['side'] == 'buy':
-            result = self.ledger.live_settle_buy(cid, executed-fees['base'], quote_amount, fees['value'], fees['cash'], now, when)
+            exec_price = quote_amount/executed if executed > 0 else None
+            result = self.ledger.live_settle_buy(cid, executed-fees['base'], quote_amount, fees['value'], fees['cash'],
+                                                 now, when, fees['base']*(exec_price or 0.0), exec_price)
         else:
             result = self.ledger.live_settle_sell(cid, executed, quote_amount, fees['value'], fees['cash'], now, when)
         self.log({'live': 'settled', 'symbol': order['symbol'], 'side': order['side'], 'filled': result['filled'],

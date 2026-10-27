@@ -204,7 +204,7 @@ This guide contains no programming code. Commands in ordinary text are things to
 
     Goal: know where to look without changing program internals. bot.py is the launcher and webhook receiver. risk.py owns the ledger, sizing, caps, pauses, exits, order intents and the news veto. exchange.py is the signed MEXC client. live.py turns order intents into real orders, settles them from MEXC's own records, and runs the go-live checks. copytrade.py holds the disconnected copy slot and its report. records.py writes the Australian-dollar CSV. market.py reads only official public MEXC spot data. strategies.py contains the two defined indicator rules. config.json contains ordinary settings. paper.sqlite saves simulated balances, unique alert IDs, review notes, and events. .env stores the private webhook token locally; it is never uploaded to GitHub. examples contains supplied alert files. tests contains the local safety checks. docs contains the staged implementation scope.
 
-    Type python -m unittest discover -s tests -v to run the local checks. Expected result: 152 tests pass. These checks, a local HTTP authentication check, and synthetic backtest runs passed in the task environment. Current MEXC connectivity, TradingView compilation and delivery, provider terms, and profitability were not verified.
+    Type python -m unittest discover -s tests -v to run the local checks. Expected result: 163 tests pass. These checks, a local HTTP authentication check, and synthetic backtest runs passed in the task environment. Current MEXC connectivity, TradingView compilation and delivery, provider terms, and profitability were not verified.
 
 19. **Use the news veto, copy slot, and AUD records — safe now.**
 
@@ -222,7 +222,9 @@ This guide contains no programming code. Commands in ordinary text are things to
 
     Goal: let the bot trade by itself within its limits, and know exactly how to stop it.
 
-    Check readiness. Type python bot.py live-preflight. Expected result: a list of checks, each passed or failed with a reason, and ready true or false. Nothing is traded; the only order sent is a test order that MEXC validates without executing. Failing is normal until the 30-day, 50-trade paper trial is complete. Fix each failed line as described, then run it again.
+    See what is left, any time. Type python bot.py doctor. It lists every requirement with done or not done, shows your paper-trading progress (days and trades so far), and prints the one next step to take. It checks only your own computer and settings, contacts nothing, and trades nothing. Run it as often as you like.
+
+    Check readiness. When doctor says you are ready, type python bot.py live-preflight. Expected result: a list of checks, each passed or failed with a reason, and ready true or false. Nothing is traded; the only order sent is a test order that MEXC validates without executing. Failing is normal until the 30-day, 50-trade paper trial is complete. Fix each failed line as described, then run it again.
 
     Start. When ready is true, type python bot.py live-start. The program checks everything again, shows a real-money warning, and asks you to type an exact sentence. Type it exactly. It then starts the webhook receiver, scanner, news veto, and the live trader. Keep that terminal open. It always asks for the sentence again after any restart; it never resumes real trading by itself. This is deliberate.
 
