@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 import urllib.error
+import urllib.parse
 from pathlib import Path
 from unittest.mock import patch
 
@@ -425,13 +426,19 @@ class PreflightTests(Base):
 
 
 class ClientTests(unittest.TestCase):
-    def make(self, responder):
+    def make(self, responder, clock=lambda: 1700000000.0, synced=True):
         seen = []
         def opener(request, timeout):
             seen.append(request)
             return responder(request)
-        client = exchange.MexcClient('KEY123', 'SECRET456', opener=opener, clock=lambda: 1700000000.0)
+        client = exchange.MexcClient('KEY123', 'SECRET456', opener=opener, clock=clock)
+        if synced:
+            client._synced = clock()
         return client, seen
+
+    @staticmethod
+    def stamp(request):
+        return int(urllib.parse.parse_qs(urllib.parse.urlparse(request.full_url).query)['timestamp'][0])
 
     class Reply(io.BytesIO):
         def __enter__(self):
@@ -504,6 +511,90 @@ class ClientTests(unittest.TestCase):
     def test_missing_credentials_refused(self):
         with self.assertRaises(ValueError):
             exchange.MexcClient('', '')
+
+    def test_timestamp_follows_mexc_clock_when_computer_clock_is_wrong(self):
+        local = [1700000000.0]
+        def responder(request):
+            if '/api/v3/time' in request.full_url:
+                return self.Reply(b'{"serverTime":1700000030000}')
+            return self.Reply(b'{}')
+        client, seen = self.make(responder, clock=lambda: local[0], synced=False)
+        client.account()
+        self.assertTrue('/api/v3/time' in seen[0].full_url)
+        self.assertEqual(self.stamp(seen[1]), 1700000030000)
+        local[0] += 10
+        client.account()
+        self.assertEqual(len(seen), 3)
+        self.assertEqual(self.stamp(seen[2]), 1700000040000)
+
+    def test_offset_is_measured_at_the_midpoint_of_the_round_trip(self):
+        ticks = iter([1700000000.0, 1700000002.0])
+        def responder(request):
+            return self.Reply(b'{"serverTime":1700000001000}')
+        client, _ = self.make(responder, clock=lambda: next(ticks), synced=False)
+        self.assertTrue(client.sync_time())
+        self.assertAlmostEqual(client._offset, 0.0)
+
+    def test_offset_is_refreshed_after_five_minutes(self):
+        local = [1700000000.0]
+        def responder(request):
+            if '/api/v3/time' in request.full_url:
+                return self.Reply(b'{"serverTime":%d}' % int(local[0]*1000))
+            return self.Reply(b'{}')
+        client, seen = self.make(responder, clock=lambda: local[0], synced=False)
+        client.account()
+        client.account()
+        self.assertEqual(len(seen), 3)
+        local[0] += exchange.RESYNC_AFTER+1
+        client.account()
+        self.assertEqual([urllib.parse.urlparse(r.full_url).path.rsplit('/', 1)[1] for r in seen],
+                         ['time', 'account', 'account', 'time', 'account'])
+
+    def test_failed_time_lookup_falls_back_to_computer_clock(self):
+        def responder(request):
+            if '/api/v3/time' in request.full_url:
+                raise urllib.error.URLError('down')
+            return self.Reply(b'{}')
+        client, seen = self.make(responder, synced=False)
+        client.account()
+        self.assertEqual(self.stamp(seen[1]), 1700000000000)
+
+    def test_timestamp_rejection_resyncs_and_retries_once(self):
+        local = [1700000000.0]
+        state = dict(offset_ms=0)
+        def responder(request):
+            if '/api/v3/time' in request.full_url:
+                return self.Reply(b'{"serverTime":%d}' % (int(local[0]*1000)+state['offset_ms']))
+            if self.stamp(request) != int(local[0]*1000)+state['offset_ms']:
+                raise urllib.error.HTTPError(request.full_url, 400, 'x', {}, io.BytesIO(
+                    b'{"code":700003,"msg":"Timestamp for this request is outside of the recvWindow"}'))
+            return self.Reply(b'{"ok":1}')
+        client, seen = self.make(responder, clock=lambda: local[0])
+        state['offset_ms'] = 20000
+        self.assertEqual(client.account(), {'ok': 1})
+        self.assertEqual(len(seen), 3)
+
+    def test_other_rejections_are_not_retried(self):
+        client, seen = self.make(self.http_error(400, b'{"code":30004,"msg":"x"}'))
+        with self.assertRaises(exchange.ExchangeError):
+            client.new_order('BTCUSDT', 'BUY', 'MARKET', 'c', quote_order_qty=5)
+        self.assertEqual(len(seen), 1)
+
+    def test_timestamp_rejection_that_persists_raises_after_one_retry(self):
+        bad = b'{"code":700003,"msg":"outside of the recvWindow"}'
+        def responder(request):
+            if '/api/v3/time' in request.full_url:
+                return self.Reply(b'{"serverTime":1700000000000}')
+            raise urllib.error.HTTPError(request.full_url, 400, 'x', {}, io.BytesIO(bad))
+        client, seen = self.make(responder)
+        with self.assertRaises(exchange.ExchangeError) as caught:
+            client.account()
+        self.assertEqual(caught.exception.code, 700003)
+        self.assertEqual(len(seen), 3)
+
+    def test_preflight_clock_check_still_uses_raw_server_time(self):
+        client, _ = self.make(lambda r: self.Reply(b'{"serverTime":1700000030000}'))
+        self.assertEqual(client.server_time(), 1700000030000)
 
 
 class HelperTests(unittest.TestCase):

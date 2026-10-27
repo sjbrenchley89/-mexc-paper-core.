@@ -10,6 +10,8 @@ import urllib.request
 from decimal import Decimal
 
 BASE = 'https://api.mexc.com'
+TIME_REJECTED = 700003
+RESYNC_AFTER = 300
 
 
 class ExchangeError(Exception):
@@ -42,6 +44,7 @@ class MexcClient:
         self._key, self._secret = key, secret.encode()
         self.base, self.recv_window, self.clock = base, recv_window, clock
         self.opener = opener or urllib.request.urlopen
+        self._offset, self._synced = 0.0, None
 
     def __repr__(self):
         return 'MexcClient(credentials hidden)'
@@ -50,11 +53,35 @@ class MexcClient:
     def from_env(cls):
         return cls(os.environ.get('MEXC_API_KEY', ''), os.environ.get('MEXC_API_SECRET', ''))
 
+    def sync_time(self):
+        """Measure how far this computer's clock is from MEXC's. Returns False and keeps the old offset on any failure."""
+        before = self.clock()
+        try:
+            server = self.server_time()
+        except (ExchangeError, Uncertain, KeyError, TypeError, ValueError):
+            return False
+        after = self.clock()
+        self._offset, self._synced = server/1000-(before+after)/2, after
+        return True
+
+    def _now_ms(self):
+        if self._synced is None or self.clock()-self._synced > RESYNC_AFTER:
+            self.sync_time()
+        return int((self.clock()+self._offset)*1000)
+
     def request(self, method, path, params=None, signed=True):
+        try:
+            return self._send(method, path, params, signed)
+        except ExchangeError as exc:
+            if not signed or exc.code != TIME_REJECTED or not self.sync_time():
+                raise
+        return self._send(method, path, params, signed)
+
+    def _send(self, method, path, params, signed):
         params = dict(params or {})
         if signed:
             params['recvWindow'] = self.recv_window
-            params['timestamp'] = int(self.clock()*1000)
+            params['timestamp'] = self._now_ms()
         query = urllib.parse.urlencode(params)
         if signed:
             query += '&signature='+hmac.new(self._secret, query.encode(), hashlib.sha256).hexdigest()
