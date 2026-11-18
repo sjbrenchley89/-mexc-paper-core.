@@ -19,7 +19,7 @@ import live
 import market
 import records
 from risk import Ledger, finite
-from strategies import evaluate, indicators
+from strategies import evaluate
 
 ROOT = Path(__file__).resolve().parent
 LIVE_COMMANDS = {'status', 'pause', 'resume', 'kill', 'review-rearm', 'news-list', 'news-block', 'news-clear',
